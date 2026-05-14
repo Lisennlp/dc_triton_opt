@@ -20,22 +20,13 @@ class TritonDCRank1D0BestGraph(object):
     BT_CROSSOVER = 4096
 
     def __init__(self, B, T, N, D, W, scaling,
-                 n_groups=1, block_m_atg=16, block_k_atg=32,
-                 block_m_3k=32, block_k_3k=None, impl="auto"):
+                 n_groups=1, block_m_atg=16, block_k_atg=32):
         device = 'cuda'
         dtype = torch.float16
         self.B, self.T, self.N, self.D, self.W = B, T, N, D, W
         self.scaling = scaling
 
-        auto_use_atg = (T <= T_THRESH and B * T <= self.BT_CROSSOVER)
-        if impl == "auto":
-            self.use_atg = auto_use_atg
-        elif impl == "atg":
-            self.use_atg = True
-        elif impl == "3k":
-            self.use_atg = False
-        else:
-            raise ValueError("impl must be one of: auto, atg, 3k")
+        self.use_atg = (T <= T_THRESH and B * T <= self.BT_CROSSOVER)
 
         self.q_s = torch.randn(B, T, N, D, device=device, dtype=dtype)
         self.k_s = torch.randn(B, T, N, D, device=device, dtype=dtype)
@@ -63,10 +54,8 @@ class TritonDCRank1D0BestGraph(object):
             self.G = n_groups
             self.H = N // n_groups
             assert N % n_groups == 0
-            self.bm = block_m_3k
-            self.bk = block_k_3k
-            if self.bk is None:
-                self.bk = 64 if B * T < 163840 else 128
+            self.bm = 32
+            self.bk = 64 if B * T < 163840 else 128
             self.s_buf_s = torch.empty(B, self.G, T, W, device=device,
                                        dtype=dtype)
             self.m_buf_s = torch.full((B, T, N), float('-inf'),

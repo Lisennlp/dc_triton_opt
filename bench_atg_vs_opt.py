@@ -1,145 +1,180 @@
-"""DC benchmark: D0-Best vs D1(PreQPostOut) vs baselines vs FA2.
+"""Full DC residual benchmark vs torch and FlashAttention-2.
 
-D0-Best  = auto-dispatch AtG/3K-Grouped CUDA Graph
-D1       = TritonDCRank1PreQPostOut (pre-mix Q, post-mix output)
-WinChunk = dc_attention_decomposed_window_chunked
-Compile  = torch.compile(WinChunk)
+Run:
+    CUDA_VISIBLE_DEVICES=2 python bench_atg_vs_opt.py
 """
-import torch, time, sys, math
-import torch._dynamo
-torch._dynamo.config.cache_size_limit = 64
-sys.path.insert(0, '/home/lishengping/dc_triton_test')
 
-from auto_best_dc import TritonDCRank1D0BestGraph
-from triton_dc_PostAfterPV import TritonDCRank1PreQPostOut
-from dc_attention_torch import dc_attention_decomposed_window_chunked
+import math
+import time
+
+import torch
+import torch._dynamo
 from flash_attn import flash_attn_func
 
-device = 'cuda'
+from dc_attention_torch import dc_attention_window_chunked_residual
+from triton_dc_residual import TritonDCResidual
+from triton_dc_fused import TritonDCResidualFused
+
+
+torch._dynamo.config.cache_size_limit = 64
+
+device = "cuda"
 dtype = torch.float16
 W = 256
 CHUNK = W
-warmup, repeat = 15, 50
+warmup, repeat = 10, 30
+TORCH_TOKEN_LIMIT = 4096
 
-decomp_compiled = torch.compile(dc_attention_decomposed_window_chunked)
 
 def make(B, T, N=32, D=128):
     q = torch.randn(B, T, N, D, device=device, dtype=dtype)
     k = torch.randn(B, T, N, D, device=device, dtype=dtype)
     v = torch.randn(B, T, N, D, device=device, dtype=dtype)
-    pw1 = torch.randn(B, T, N, 1, device=device, dtype=dtype)
-    pw2 = torch.randn(B, T, 1, N, device=device, dtype=dtype)
-    pw3 = torch.randn(B, T, N, 1, device=device, dtype=dtype)
-    pw4 = torch.randn(B, T, 1, N, device=device, dtype=dtype)
-    pw1p = pw1.squeeze(-1).contiguous()
-    pw2p = pw2.squeeze(2).contiguous()
-    pw3p = pw3.squeeze(-1).contiguous()
-    pw4p = pw4.squeeze(2).contiguous()
-    pre_w = (pw1 @ pw2).contiguous()
-    post_w = (pw3 @ pw4).contiguous()
-    return q, k, v, pw1, pw2, pw3, pw4, pw1p, pw2p, pw3p, pw4p, pre_w, post_w
+    pre_w1 = torch.randn(B, T, N, device=device, dtype=dtype)
+    pre_w2 = torch.randn(B, T, N, device=device, dtype=dtype)
+    pre_dd = torch.randn(B, T, N, device=device, dtype=dtype)
+    post_w1 = torch.randn(B, T, N, device=device, dtype=dtype)
+    post_w2 = torch.randn(B, T, N, device=device, dtype=dtype)
+    post_dd = torch.randn(B, T, N, device=device, dtype=dtype)
+    return q, k, v, (pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd)
 
-def bench(fn):
-    for _ in range(warmup): fn()
+
+def bench(fn, warmup_iters=warmup, repeat_iters=repeat):
+    for _ in range(warmup_iters):
+        fn()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    for _ in range(repeat): fn()
+    for _ in range(repeat_iters):
+        fn()
     torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / repeat * 1e6
+    return (time.perf_counter() - t0) / repeat_iters * 1e6
+
 
 def fmt_us(us):
-    if us >= 1e18:
-        return "     OOM"
-    return f"{us:7.0f}\u00b5"
-
-def fmt_ratio(us, ref):
+    if us is None:
+        return "   skip"
     if us >= 1e18:
         return "    OOM"
-    return f"{us/ref:6.2f}\u00d7"
+    return f"{us:7.0f}u"
+
+
+def fmt_ratio(us, ref):
+    if us is None:
+        return "   skip"
+    if us >= 1e18:
+        return "    OOM"
+    return f"{us / ref:6.2f}x"
+
 
 N, D = 32, 128
-sc = 1.0 / (D ** 0.5)
+sc = 1.0 / math.sqrt(D)
 
 configs = [
-    (1, 256), (1, 512), (1, 1024), (1, 2048), (1, 4096),
-    (4, 256), (4, 512), (4, 1024), (4, 2048), (4, 4096),
-    (8, 256), (8, 512), (8, 1024), (8, 2048), (8, 4096),
-    (16, 256), (16, 512), (16, 1024), (16, 2048), (16, 4096),
-    (32, 256), (32, 512), (32, 1024), (32, 2048), (32, 4096),
-    (64, 256), (64, 512), (64, 1024), (64, 2048), (64, 4096),
+    (1, 256),
+    (1, 512),
+    (1, 1024),
+    (1, 2048),
+    (1, 4096),
+    (16, 4096),
+    (32, 2048),
+    (32, 4096),
+    (64, 2048),
+    (64, 4096),
 ]
 
-# configs = [
-#     (1, 256), (1, 512), (1, 1024), (1, 2048), (1, 4096),
-#     (32, 256), (32, 512), (32, 1024), (32, 2048), (32, 4096),
-# ]
 
+print("=" * 60)
+print("Correctness check (fused vs torch)")
+print("=" * 60)
+for B_c, T_c in [(1, 256), (1, 512), (2, 1024)]:
+    q_c, k_c, v_c, dc_c = make(B_c, T_c, N, D)
+    sl_c = torch.full((B_c,), T_c, device=device, dtype=torch.int32)
+    ref = dc_attention_window_chunked_residual(q_c, k_c, v_c, dc_c, sc, W, sl_c, CHUNK)
+    # ref is [B,N,T,D] (from torch.cat on dim=2)
+    fused_out = TritonDCResidualFused.forward(q_c, k_c, v_c, dc_c, sc, W, sl_c)
+    # fused_out is [B,T,N,D], transpose to [B,N,T,D] for comparison
+    fused_bntd = fused_out.permute(0, 2, 1, 3).contiguous()
+    diff = (fused_bntd.float() - ref.float()).abs()
+    rdiff = diff / (ref.float().abs() + 1e-6)
+    print(f"  B={B_c} T={T_c}: max_abs={diff.max().item():.4e}  max_rel={rdiff.max().item():.4e}  "
+          f"mean_abs={diff.mean().item():.4e}")
+    del q_c, k_c, v_c, dc_c, sl_c, ref, fused_bntd, fused_out
+    torch.cuda.empty_cache()
+print()
 
-hdr = (f"{'B':>3s} {'T':>5s} {'B*T':>7s} | "
-       f"{'D0-Bst':>8s} {'D1':>8s} {'WinChk':>8s} {'Compile':>8s} | "
-       f"{'FA2-w':>8s} {'FA2-f':>8s} | "
-       f"{'D0/FA2-w':>7s} {'D1/FA2-w':>7s} {'WC/FA2-w':>7s} {'Cmp/FA2-w':>7s} {'D0/FA2-f':>7s}")
+hdr = (
+    f"{'B':>3s} {'T':>5s} {'B*T':>7s} | "
+    f"{'Fused':>8s} {'Opt':>8s} {'Torch':>8s} | "
+    f"{'FA2-w':>8s} {'FA2-f':>8s} | "
+    f"{'Fsd/FA2w':>9s} {'Opt/FA2w':>9s} {'Fsd/FA2f':>9s}"
+)
 print(hdr)
 print("-" * len(hdr))
 
 for B, T in configs:
     tokens = B * T
-    q, k, v, pw1, pw2, pw3, pw4, pw1p, pw2p, pw3p, pw4p, pre_w, post_w = make(B, T)
+    q, k, v, dc_weights = make(B, T, N, D)
     sl = torch.full((B,), T, device=device, dtype=torch.int32)
 
-    # D0-BestGraph (auto-dispatch)
     try:
-        best_eng = TritonDCRank1D0BestGraph(B, T, N, D, W, sc)
-        best_eng(q, k, v, pw1p, pw2p, pw3p, pw4p)
-        us_d0 = bench(lambda: best_eng.replay_only())
-        del best_eng
-    except Exception:
-        us_d0 = float('inf')
-
-    # D1 - PreQPostOut
-    try:
-        TritonDCRank1PreQPostOut.forward(
-            q, k, v, pw1, pw2, pw3, pw4, sc, W, sl)
-        us_d1 = bench(lambda: TritonDCRank1PreQPostOut.forward(
-            q, k, v, pw1, pw2, pw3, pw4, sc, W, sl))
-    except Exception:
-        us_d1 = float('inf')
+        fused_out = TritonDCResidualFused.forward(q, k, v, dc_weights, sc, W, sl)
+        us_fused = bench(
+            lambda: TritonDCResidualFused.forward(q, k, v, dc_weights, sc, W, sl)
+        )
+    except Exception as exc:
+        print(f"[Fused failed] B={B} T={T}: {type(exc).__name__}: {exc}")
+        us_fused = float("inf")
         torch.cuda.empty_cache()
 
-    # Window-chunked baseline
     try:
-        dc_attention_decomposed_window_chunked(q, k, v, pre_w, post_w, sc, W, sl, CHUNK)
-        us_wc = bench(lambda: dc_attention_decomposed_window_chunked(
-            q, k, v, pre_w, post_w, sc, W, sl, CHUNK))
-    except Exception:
-        us_wc = float('inf')
+        opt_buffers = TritonDCResidual.alloc_buffers(q, W)
+        TritonDCResidual.forward(q, k, v, dc_weights, sc, W, sl, buffers=opt_buffers)
+        us_opt = bench(
+            lambda: TritonDCResidual.forward(
+                q, k, v, dc_weights, sc, W, sl, buffers=opt_buffers
+            )
+        )
+    except Exception as exc:
+        print(f"[Opt failed] B={B} T={T}: {type(exc).__name__}: {exc}")
+        us_opt = float("inf")
         torch.cuda.empty_cache()
 
-    # torch.compile version
-    try:
-        decomp_compiled(q, k, v, pre_w, post_w, sc, W, sl, CHUNK)
-        us_compile = bench(lambda: decomp_compiled(q, k, v, pre_w, post_w, sc, W, sl, CHUNK))
-    except Exception:
-        us_compile = float('inf')
-        torch.cuda.empty_cache()
+    if tokens <= TORCH_TOKEN_LIMIT:
+        try:
+            dc_attention_window_chunked_residual(q, k, v, dc_weights, sc, W, sl, CHUNK)
+            us_torch = bench(
+                lambda: dc_attention_window_chunked_residual(
+                    q, k, v, dc_weights, sc, W, sl, CHUNK
+                ),
+                warmup_iters=5,
+                repeat_iters=10,
+            )
+        except Exception:
+            us_torch = float("inf")
+            torch.cuda.empty_cache()
+    else:
+        us_torch = None
 
-    # FA2
-    us_faw = bench(lambda: flash_attn_func(q, k, v, softmax_scale=sc,
-                                            causal=True, window_size=(W-1, 0)))
+    us_faw = bench(
+        lambda: flash_attn_func(
+            q, k, v, softmax_scale=sc, causal=True, window_size=(W - 1, 0)
+        )
+    )
     us_faf = bench(lambda: flash_attn_func(q, k, v, softmax_scale=sc, causal=True))
 
-    print(f"{B:3d} {T:5d} {tokens:7d} | "
-          f"{fmt_us(us_d0)} {fmt_us(us_d1)} {fmt_us(us_wc)} {fmt_us(us_compile)} | "
-          f"{fmt_us(us_faw)} {fmt_us(us_faf)} | "
-          f"{fmt_ratio(us_d0, us_faw)} {fmt_ratio(us_d1, us_faw)} "
-          f"{fmt_ratio(us_wc, us_faw)} {fmt_ratio(us_compile, us_faw)} {fmt_ratio(us_d0, us_faf)}")
+    print(
+        f"{B:3d} {T:5d} {tokens:7d} | "
+        f"{fmt_us(us_fused)} {fmt_us(us_opt)} {fmt_us(us_torch)} | "
+        f"{fmt_us(us_faw)} {fmt_us(us_faf)} | "
+        f"{fmt_ratio(us_fused, us_faw)} {fmt_ratio(us_opt, us_faw)} {fmt_ratio(us_fused, us_faf)}"
+    )
 
+    del q, k, v, dc_weights, sl
     torch.cuda.empty_cache()
 
 print()
-print("D0-Bst  = TritonDCRank1D0BestGraph (auto-dispatch AtG/3K-Grp CUDA Graph)")
-print("D1      = TritonDCRank1PreQPostOut (pre-mix Q, post-mix output)")
-print(f"WinChk  = dc_attention_decomposed_window_chunked (chunk={CHUNK})")
-print("Compile = torch.compile(WinChk)")
-print(f"FA2-w   = FlashAttention-2 window_size={W}")
-print("FA2-f   = FlashAttention-2 full causal")
+print("Fused = TritonDCResidualFused single-kernel fused DC")
+print("Opt   = TritonDCResidual multi-kernel DC (previous best)")
+print(f"Torch = dc_attention_window_chunked_residual, skipped above {TORCH_TOKEN_LIMIT} tokens")
+print(f"FA2-w = FlashAttention-2 causal sliding window, window_size={W}")
+print("FA2-f = FlashAttention-2 full causal")
