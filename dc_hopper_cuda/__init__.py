@@ -37,3 +37,33 @@ def forward_hpg4_bm32_ref(
         int(window),
     )
 
+
+def forward_hpg4_wide_ref(
+    q,
+    k,
+    v,
+    pre_w1,
+    pre_w2,
+    pre_dd,
+    post_w1,
+    post_w2,
+    post_dd,
+    scaling,
+    window,
+    chunk_size,
+):
+    """Scalar CUDA reference path for KL=256 wide-window HPG=4 targets."""
+    return _ext().forward_hpg4_wide_ref(
+        q,
+        k,
+        v,
+        pre_w1,
+        pre_w2,
+        pre_dd,
+        post_w1,
+        post_w2,
+        post_dd,
+        float(scaling),
+        int(window),
+        int(chunk_size),
+    )

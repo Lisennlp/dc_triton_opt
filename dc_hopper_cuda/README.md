@@ -8,12 +8,13 @@ The initial implementation is intentionally a narrow correctness scaffold:
 - `N=32`
 - `G=8`
 - `HPG=4`
-- `BM=32`
-- `W in {96, 224}`
+- `KL=256`
+- `BM=32,W=224`
+- `BM=16,W=240`
 - fp16 tensors
 - contiguous `[B, T, N, D]` Q/K/V and `[B, T, N]` DC weights
 
-`forward_hpg4_bm32_ref` is a scalar CUDA reference kernel, not the performance
+`forward_hpg4_wide_ref` is a scalar CUDA reference kernel, not the performance
 target. It exists to lock down the C++/Python extension API and correctness
 tests before replacing the inner loops with a Hopper WGMMA/TMA or cluster/DSM
 mainloop.

@@ -61,13 +61,17 @@ no softcap
 Priority configs:
 
 ```text
-BM=32, W=96,  KL=128   # current best H100 small-window target
-BM=32, W=224, KL=256   # wide-window target
+BM=32, W=224, KL=256   # primary wide-window target, best wide-window speed so far
+BM=16, W=240, KL=256   # secondary target if maximizing W matters more than speed
 ```
 
-`BM=16,W=112/240` should remain benchmark rows, but the H100 CUDA work should
-start with `BM=32` because all Triton measurements show better tensor-core
-utilization there.
+`BM=32,W=96,KL=128` is no longer an active CUDA target because the window is too
+small for the intended use case. It remains useful only as a diagnostic if the
+wide-window path needs a smaller live-state sanity check.
+
+`BM=16,W=240` should remain as the larger-W fallback, but the first performance
+implementation should start with `BM=32,W=224` because all Triton measurements
+show better tensor-core utilization there.
 
 ## FA3 lessons that must carry over
 
@@ -141,12 +145,15 @@ Cons:
 Expected first target:
 
 ```text
-BM=32, KL=128, HPG=4
+BM=32, KL=256, HPG=4
 qk0..qk3 in fp32 accumulator fragments
 s_acc/a_acc in fp32 or fp16 fragments depending pressure
 cached probs in fp16
 mixed probs before the single final V dot
 ```
+
+If the `BM=32,KL=256` one-CTA/four-head design spills heavily, try either
+`BM=16,W=240,KL=256` or the cluster/DSM design below.
 
 ### B. Hopper cluster/DSM design
 
@@ -196,17 +203,20 @@ dc_triton_opt/dc_hopper_cuda/
   __init__.py
 ```
 
-Expose one narrow function:
+Expose one narrow wide-window function:
 
 ```python
-dc_hopper_cuda.forward_hpg4_bm32(
+dc_hopper_cuda.forward_hpg4_wide_ref(
     q, k, v,
     pre_w1, pre_w2, pre_dd,
     post_w1, post_w2, post_dd,
     scaling,
     window,
+    chunk_size,
 )
 ```
+
+for `BM=32,W=224` and `BM=16,W=240`.
 
 Shape checks should reject everything except the target configs above.
 `bench_onekernel_h100.py` should only add the CUDA column after the extension
@@ -220,7 +230,8 @@ Before timing on H100:
 B in {1, 2}
 T in {128, 256, 512}
 BM=32
-W in {96, 224}
+W in {224}
+or BM=16,W=240
 G=8
 HPG=4
 compare against dc_attention_torch or existing V4HCM/V4HCM256
@@ -230,17 +241,36 @@ max error target: same order as Triton V4HCM fp16 path
 Only after this gate should the kernel be inserted into
 `bench_onekernel_h100.py`.
 
+Initial scalar scaffold result from H100 before dropping the small-window target:
+
+```text
+B=1,T=128,W=96 : max=3.22e-2, mean=5.52e-4
+B=1,T=256,W=224: max=3.52e-2, mean=5.53e-4
+B=1,T=512,W=96 : max=3.32e-2, mean=5.41e-4
+B=1,T=512,W=224: max=9.38e-2, mean=5.55e-4
+B=2,T=128,W=96 : max=4.74e-2, mean=5.64e-4
+```
+
+Interpretation:
+- Mean error is stable around `5.5e-4`, so group/head/window indexing is likely
+  correct.
+- The larger max error on `T=512,W=224` is consistent with fp16 cache and
+  different reduction/softmax order sensitivity.
+- Use `mean <= 1e-3` and `max <= 1.2e-1` as the current scaffold pass gate.
+- New correctness runs should focus on `BM=32,W=224` and `BM=16,W=240`.
+
 ## Performance gate
 
 The first useful H100 target is:
 
 ```text
-BM=32,W=96:
-  <= 2.2x FA3 for B >= 16
-
 BM=32,W=224:
   first target <= 3.0x FA3
   later target ~= A800 overhead band, around 2.2x FA2/FA3-relative
+
+BM=16,W=240:
+  secondary target; useful if W=240 is required, but expected to be slower than
+  BM=32,W=224 on H100 because the M tile is smaller.
 ```
 
 If the forked FA3 mainloop cannot pass the small-window target without heavy

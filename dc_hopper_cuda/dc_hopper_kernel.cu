@@ -8,7 +8,6 @@
 
 namespace {
 
-constexpr int kBM = 32;
 constexpr int kNHeads = 32;
 constexpr int kHeadDim = 128;
 constexpr int kG = 8;
@@ -49,23 +48,24 @@ __global__ void dc_hpg4_bm32_ref_kernel(
     int T,
     float scaling,
     int window,
+    int BM,
     int KL) {
     const int b = blockIdx.x;
     const int m_block = blockIdx.y;
     const int group = blockIdx.z;
     const int tid = threadIdx.x;
-    const int q_start = m_block * kBM;
+    const int q_start = m_block * BM;
     const int k_start = q_start - window + 1;
 
     extern __shared__ half smem[];
     half* qk_smem = smem;                         // [HPG, BM, KL]
-    half* probs = qk_smem + kHPG * kBM * KL;       // [HPG, BM, KL]
-    half* a_acc = probs + kHPG * kBM * KL;         // [BM, KL]
+    half* probs = qk_smem + kHPG * BM * KL;        // [HPG, BM, KL]
+    half* a_acc = probs + kHPG * BM * KL;          // [BM, KL]
 
-    const int score_elems = kHPG * kBM * KL;
+    const int score_elems = kHPG * BM * KL;
     for (int idx = tid; idx < score_elems; idx += blockDim.x) {
-        const int hloc = idx / (kBM * KL);
-        const int rem = idx - hloc * kBM * KL;
+        const int hloc = idx / (BM * KL);
+        const int rem = idx - hloc * BM * KL;
         const int m = rem / KL;
         const int j = rem - m * KL;
         const int h = group * kHPG + hloc;
@@ -87,9 +87,9 @@ __global__ void dc_hpg4_bm32_ref_kernel(
     __syncthreads();
 
     // Build DC-pre scores and softmax rows. One thread owns one (head, query row).
-    for (int row = tid; row < kHPG * kBM; row += blockDim.x) {
-        const int hloc = row / kBM;
-        const int m = row - hloc * kBM;
+    for (int row = tid; row < kHPG * BM; row += blockDim.x) {
+        const int hloc = row / BM;
+        const int m = row - hloc * BM;
         const int h = group * kHPG + hloc;
         const int qpos = q_start + m;
         const int wi = w_idx(b, qpos, h, T);
@@ -109,38 +109,38 @@ __global__ void dc_hpg4_bm32_ref_kernel(
                         const int h2 = group * kHPG + hh;
                         const int wi2 = w_idx(b, qpos, h2, T);
                         const float w1 = __half2float(pre_w1[wi2]);
-                        const float qk = __half2float(qk_smem[(hh * kBM + m) * KL + j]);
+                        const float qk = __half2float(qk_smem[(hh * BM + m) * KL + j]);
                         s_acc += w1 * qk;
                     }
-                    const float qk_h = __half2float(qk_smem[(hloc * kBM + m) * KL + j]);
+                    const float qk_h = __half2float(qk_smem[(hloc * BM + m) * KL + j]);
                     score = pdd * qk_h + pw2 * s_acc;
                 }
-                probs[(hloc * kBM + m) * KL + j] = __float2half_rn(score);
+                probs[(hloc * BM + m) * KL + j] = __float2half_rn(score);
                 max_score = fmaxf(max_score, score);
             }
 
             float denom = 0.0f;
             for (int j = 0; j < KL; ++j) {
-                const float score = __half2float(probs[(hloc * kBM + m) * KL + j]);
+                const float score = __half2float(probs[(hloc * BM + m) * KL + j]);
                 const float p = isfinite(score) ? expf(score - max_score) : 0.0f;
-                probs[(hloc * kBM + m) * KL + j] = __float2half_rn(p);
+                probs[(hloc * BM + m) * KL + j] = __float2half_rn(p);
                 denom += p;
             }
             const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
             for (int j = 0; j < KL; ++j) {
-                const float p = __half2float(probs[(hloc * kBM + m) * KL + j]) * inv_denom;
-                probs[(hloc * kBM + m) * KL + j] = __float2half_rn(p);
+                const float p = __half2float(probs[(hloc * BM + m) * KL + j]) * inv_denom;
+                probs[(hloc * BM + m) * KL + j] = __float2half_rn(p);
             }
         } else {
             for (int j = 0; j < KL; ++j) {
-                probs[(hloc * kBM + m) * KL + j] = __float2half_rn(0.0f);
+                probs[(hloc * BM + m) * KL + j] = __float2half_rn(0.0f);
             }
         }
     }
     __syncthreads();
 
     // Build post a_acc in shared memory.
-    for (int idx = tid; idx < kBM * KL; idx += blockDim.x) {
+    for (int idx = tid; idx < BM * KL; idx += blockDim.x) {
         const int m = idx / KL;
         const int j = idx - m * KL;
         const int qpos = q_start + m;
@@ -151,7 +151,7 @@ __global__ void dc_hpg4_bm32_ref_kernel(
                 const int h2 = group * kHPG + hh;
                 const int wi2 = w_idx(b, qpos, h2, T);
                 const float w1 = __half2float(post_w1[wi2]);
-                const float p = __half2float(probs[(hh * kBM + m) * KL + j]);
+                const float p = __half2float(probs[(hh * BM + m) * KL + j]);
                 acc += w1 * p;
             }
         }
@@ -160,10 +160,10 @@ __global__ void dc_hpg4_bm32_ref_kernel(
     __syncthreads();
 
     // Final mixed-probability V dot.
-    const int out_elems = kHPG * kBM * kHeadDim;
+    const int out_elems = kHPG * BM * kHeadDim;
     for (int idx = tid; idx < out_elems; idx += blockDim.x) {
-        const int hloc = idx / (kBM * kHeadDim);
-        const int rem = idx - hloc * kBM * kHeadDim;
+        const int hloc = idx / (BM * kHeadDim);
+        const int rem = idx - hloc * BM * kHeadDim;
         const int m = rem / kHeadDim;
         const int d = rem - m * kHeadDim;
         const int h = group * kHPG + hloc;
@@ -177,7 +177,7 @@ __global__ void dc_hpg4_bm32_ref_kernel(
             for (int j = 0; j < KL; ++j) {
                 const int kpos = k_start + j;
                 if (kpos >= 0 && kpos < T) {
-                    const float p = __half2float(probs[(hloc * kBM + m) * KL + j]);
+                    const float p = __half2float(probs[(hloc * BM + m) * KL + j]);
                     const float aa = __half2float(a_acc[m * KL + j]);
                     const float mixed = pdd * p + pw2 * aa;
                     const float vv = __half2float(v[qkv_idx(b, kpos, h, d, T)]);
@@ -199,7 +199,8 @@ void check_fixed_inputs(
     const torch::Tensor& post_w1,
     const torch::Tensor& post_w2,
     const torch::Tensor& post_dd,
-    int64_t window) {
+    int64_t window,
+    int64_t chunk_size) {
     CHECK_CUDA(q);
     CHECK_CUDA(k);
     CHECK_CUDA(v);
@@ -241,12 +242,14 @@ void check_fixed_inputs(
     TORCH_CHECK(post_w1.sizes() == pre_w1.sizes(), "post_w1 must match pre_w1");
     TORCH_CHECK(post_w2.sizes() == pre_w1.sizes(), "post_w2 must match pre_w1");
     TORCH_CHECK(post_dd.sizes() == pre_w1.sizes(), "post_dd must match pre_w1");
-    TORCH_CHECK(window == 96 || window == 224, "reference scaffold only supports W=96 or W=224");
+    TORCH_CHECK(
+        (chunk_size == 32 && window == 224) || (chunk_size == 16 && window == 240),
+        "wide reference scaffold supports only BM=32,W=224 or BM=16,W=240");
 }
 
 }  // namespace
 
-torch::Tensor forward_hpg4_bm32_ref(
+torch::Tensor forward_hpg4_wide_ref(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -257,17 +260,20 @@ torch::Tensor forward_hpg4_bm32_ref(
     torch::Tensor post_w2,
     torch::Tensor post_dd,
     double scaling,
-    int64_t window) {
-    check_fixed_inputs(q, k, v, pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd, window);
+    int64_t window,
+    int64_t chunk_size) {
+    check_fixed_inputs(
+        q, k, v, pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd, window, chunk_size);
 
     const int B = static_cast<int>(q.size(0));
     const int T = static_cast<int>(q.size(1));
-    const int KL = window == 96 ? 128 : 256;
+    const int BM = static_cast<int>(chunk_size);
+    const int KL = 256;
 
     auto out = torch::empty_like(q);
     const int threads = 256;
-    dim3 grid(B, (T + kBM - 1) / kBM, kG);
-    const int smem_bytes = (2 * kHPG * kBM * KL + kBM * KL) * static_cast<int>(sizeof(half));
+    dim3 grid(B, (T + BM - 1) / BM, kG);
+    const int smem_bytes = (2 * kHPG * BM * KL + BM * KL) * static_cast<int>(sizeof(half));
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         dc_hpg4_bm32_ref_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -287,7 +293,36 @@ torch::Tensor forward_hpg4_bm32_ref(
         T,
         static_cast<float>(scaling),
         static_cast<int>(window),
+        BM,
         KL);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+torch::Tensor forward_hpg4_bm32_ref(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor pre_w1,
+    torch::Tensor pre_w2,
+    torch::Tensor pre_dd,
+    torch::Tensor post_w1,
+    torch::Tensor post_w2,
+    torch::Tensor post_dd,
+    double scaling,
+    int64_t window) {
+    TORCH_CHECK(window == 224, "BM=32 path is now reserved for the wide W=224 target");
+    return forward_hpg4_wide_ref(
+        q,
+        k,
+        v,
+        pre_w1,
+        pre_w2,
+        pre_dd,
+        post_w1,
+        post_w2,
+        post_dd,
+        scaling,
+        window,
+        32);
 }

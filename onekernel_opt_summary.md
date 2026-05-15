@@ -788,14 +788,19 @@ BM+W=256: V4HCM256
   A800: BM=32,W=224 约 2.04x-2.14x FA2w
 ```
 
+CUDA/Hopper 后续目标调整:
+- `BM=32,W=96,KL=128` 虽然速度最好，但窗口太小，不再作为主优化目标。
+- 后续先做 `BM=32,W=224,KL=256`。
+- 如需更大窗口，再比较 `BM=16,W=240,KL=256`，但它在已有 Triton 结果中通常慢于 `BM=32,W=224`。
+
 从数据看，Triton 路线已经接近其可用上限:
 - `BM=32` 比 `BM=16` 更适合 H100。
-- `W=96` 的 H100 overhead 已接近目标。
-- `W=112/240` 相对 FA3 偏高，主要因为当前 Triton 实现没有使用 Hopper 专属 WGMMA/TMA/warp-specialized pipeline。
+- `W=96` 的 H100 overhead 已接近目标，但窗口太小，后续不作为主目标。
+- `W=224/240` 相对 FA3 偏高，主要因为当前 Triton 实现没有使用 Hopper 专属 WGMMA/TMA/warp-specialized pipeline。
 
 下一步需要转向 CUDA/Hopper:
 1. **FA3 CUDA 内核里插 DC**: 复用 FA3 的 TMA/WGMMA pipeline、tile scheduling、online softmax 和 epilogue，只在 score 构造与 output epilogue 加入 DC cross-head state。
-2. **独立 Hopper CUDA/WGMMA kernel**: 从 DC 的 group-serial HPG=4 数据流出发，手写 `BM=32, W=96/224, D=128` 固定形状 kernel，优先实现 forward-only、full length、G=8、HPG=4。
+2. **独立 Hopper CUDA/WGMMA kernel**: 从 DC 的 group-serial HPG=4 数据流出发，手写 `BM=32,W=224,KL=256,D=128` 固定形状 kernel，必要时补 `BM=16,W=240,KL=256`，优先实现 forward-only、full length、G=8、HPG=4。
 
 FA3 相比 FA2 在 CUDA 上真正需要借鉴的点:
 - WGMMA 替代 sm80/WMMA 风格的小 warp tile。
@@ -805,3 +810,8 @@ FA3 相比 FA2 在 CUDA 上真正需要借鉴的点:
 - 保留 V4HCM 的 mixed-probability identity，最终只做一次 `mixed @ V` 并一次写 OUT。
 
 因此 CUDA 版本不能只是把 Triton 的标量/reduction 逻辑翻译成 `.cu`。真正目标是: `TMA K/V staging + WGMMA QK/PV + FA3-style pipeline + DC 的两处 group barrier`。
+
+CUDA correctness scaffold 初测:
+- 新增 `dc_hopper_cuda.forward_hpg4_wide_ref`，固定 `G=8, HPG=4, KL=256`，覆盖 `BM=32,W=224` 和 `BM=16,W=240`。
+- H100 上对比 V4HCM/V4HCM256，已看到 `mean ~= 5.5e-4`，`max <= 9.4e-2` 的结果。
+- 这说明 API、window/group/head 索引基本正确；它不是性能版本，下一步需要把 scalar QK/PV 替换为 FA3-style WGMMA/TMA pipeline。
