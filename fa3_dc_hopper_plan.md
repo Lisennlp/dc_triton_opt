@@ -287,6 +287,64 @@ First tensor-core experiment:
 - Validate with `test_dc_hopper_cuda.py --opt`, then benchmark with
   `bench_dc_hopper_cuda.py`.
 
+H100 benchmark result:
+
+```text
+B= 8:  V4HCM256  2219us, CUDAopt  32117us, opt/V4 14.48x
+B=16:  V4HCM256  4403us, CUDAopt  64405us, opt/V4 14.63x
+B=32:  V4HCM256  8781us, CUDAopt 129554us, opt/V4 14.75x
+B=64:  V4HCM256 17545us, CUDAopt 278217us, opt/V4 15.86x
+```
+
+Conclusion:
+- The naive one-CTA WMMA/scalar hybrid is structurally wrong for performance.
+- Moving only QK/final V dot to WMMA is not enough; scalar softmax and
+  shared-memory staging dominate, and there is no FA3-style TMA/producer-
+  consumer overlap.
+- Do not spend more time micro-optimizing this WMMA path.
+- Keep it only as a diagnostic negative result; the next implementation must
+  fork the FA3 Hopper pipeline or use Hopper cluster/DSM.
+
+Cluster/DSM smoke test:
+- Added `cluster_dsm_smoke(num_clusters)`.
+- It launches clusters with `clusterDim.x = 4`.
+- Each CTA writes its rank value into shared memory, synchronizes the cluster,
+  then reads all four CTA shared-memory values through DSM.
+- Expected output is `[num_clusters, 4]` filled with `10.0`.
+- This validates the PyTorch extension launch path for Hopper cluster/DSM before
+  implementing DC cross-head exchange.
+
+Short Triton probe before the CUDA rewrite:
+- Added `TritonDCOneKernelMixedProbs256Narrow` (`V4HCM256N`) to reduce
+  `KL=256` live-state pressure by keeping `s_acc/a_acc` in fp16.
+- It keeps the `V4HCM256` mixed-output identity and only changes accumulator
+  precision.
+- Local A800 sanity vs `V4HCM256`:
+
+```text
+BM=16,W=240: max=4.69e-2, mean=3.50e-4
+BM=32,W=224: max=3.13e-2, mean=3.47e-4
+```
+
+- Short A800 latency showed a small gain on `BM=16,W=240` and near tie on
+  `BM=32,W=224`; H100 should decide whether this remains in the table.
+- H100 retest showed a regression: about `+2.3%` for `BM=16,W=240` and `+3.0%`
+  for `BM=32,W=224`. Keep it in the A800 benchmark only; remove it from the
+  H100 main table.
+
+Cluster/DSM diagnostic forward:
+- Added `forward_hpg4_wide_cluster`.
+- Scope: `G=8,HPG=4,KL=256`, with `BM=16,W=240` and `BM=32,W=224`.
+- Launches `clusterDim.x=4`; each CTA rank owns one head in the HPG group.
+- DSM exchange points:
+  1. after per-head QK tile construction, each CTA reads the four QK tiles to
+     build its DC-pre score and softmax;
+  2. after per-head probability construction, each CTA reads the four probs
+     tiles to build post `a_acc` for final mixed AV.
+- Current inner loops are scalar. This is a correctness/structure probe, not
+  the final performance path. If it passes, replace the scalar QK/PV sections
+  with a FA3/CuTe WGMMA/TMA mainloop.
+
 ## Performance gate
 
 The first useful H100 target is:

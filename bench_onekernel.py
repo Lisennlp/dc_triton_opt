@@ -29,6 +29,7 @@ from triton_dc_onekernel_v4_h100 import TritonDCOneKernelCombined as V4HC
 from triton_dc_onekernel_v4_h100 import TritonDCOneKernelCombinedProbs as V4HCP
 from triton_dc_onekernel_v4_h100 import TritonDCOneKernelMixedProbs as V4HCM
 from triton_dc_onekernel_v4_h100 import TritonDCOneKernelMixedProbs256 as V4HCM256
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernelMixedProbs256Narrow as V4HCM256N
 from triton_dc_onekernel_Prev0 import TritonDCOneKernel as PreV0
 from triton_dc_onekernel_Postv0 import TritonDCOneKernel as PostV0
 from triton_dc_onekernel_Postv1 import TritonDCOneKernel as PostV1
@@ -185,6 +186,11 @@ def full_dc_variants(q, k, v, ws, sl, BM: int, W: int, G: int, HPG: int, KL: int
             supports_hpg4_256(BM, W, G, HPG, KL),
             lambda: V4HCM256.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
         ),
+        (
+            "V4HCM256N",
+            supports_hpg4_256(BM, W, G, HPG, KL),
+            lambda: V4HCM256N.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
     ]
 
 
@@ -214,9 +220,9 @@ Bs = parse_int_list("B_LIST", "8,16,32,64")
 configs = parse_configs("16:112,32:96,16:240,32:224")
 Gs = parse_int_list("G_LIST", "8")
 
-full_variant_names = ["V3", "V4", "V5", "V4H", "V4HC", "V4HCP", "V4HCM", "V4HCM256"]
+full_variant_names = ["V3", "V4", "V5", "V4H", "V4HC", "V4HCP", "V4HCM", "V4HCM256", "V4HCM256N"]
 variant_names = list(full_variant_names)
-ratio_names = ["V3", "V4", "V5", "V4H", "V4HCM", "V4HCM256"]
+ratio_names = ["V3", "V4", "V5", "V4H", "V4HCM", "V4HCM256", "V4HCM256N"]
 if run_components:
     variant_names += ["Pre0", "Post0", "Post1"]
     ratio_names += ["Pre0", "Post1"]
@@ -289,6 +295,7 @@ print("V4HC     = BM+W=128 combined-output path, one OUT store")
 print("V4HCP    = V4HC + cached fp16 probabilities")
 print("V4HCM    = V4HCP + mixed final attention weights, one final V dot")
 print("V4HCM256 = V4HCM idea for BM+W=256 / KL=256")
+print("V4HCM256N= V4HCM256 with fp16 s_acc/a_acc to reduce KL=256 register pressure")
 if run_components:
     print("Pre0/Post0/Post1 are component experiments, not full DC replacements.")
 if _fa2_error is not None:

@@ -1168,6 +1168,64 @@ class TritonDCOneKernelMixedProbs256:
         return out
 
 
+class TritonDCOneKernelMixedProbs256Narrow:
+    """V4HCM256N: V4HCM256 with fp16 s_acc/a_acc to reduce KL=256 register pressure."""
+
+    @staticmethod
+    def forward(
+        q, k, v, dc_weights, scaling, window,
+        seq_lens=None, G=16, chunk_size=16,
+    ):
+        pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd = dc_weights
+        B, T, N, D = q.shape
+        W = min(int(window), T)
+        HPG = N // G
+        assert N % G == 0
+        assert HPG >= 2 and HPG % 2 == 0, f"HPG={HPG} must be even and >= 2"
+
+        KSPAN = chunk_size + W - 1
+        KL = triton.next_power_of_2(KSPAN)
+        if not (D == 128 and G <= 8 and HPG == 4 and KL == 256 and chunk_size + W == 256):
+            return TritonDCOneKernelMixedProbs256.forward(q, k, v, dc_weights, scaling, window, seq_lens, G=G, chunk_size=chunk_size)
+
+        full_len_fast = seq_lens is None and T % chunk_size == 0 and T >= chunk_size + W
+
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+        pre_w1 = pre_w1.contiguous(); pre_w2 = pre_w2.contiguous()
+        pre_dd = pre_dd.contiguous(); post_w1 = post_w1.contiguous()
+        post_w2 = post_w2.contiguous(); post_dd = post_dd.contiguous()
+        seq_lens_arg = seq_lens
+        if seq_lens_arg is None:
+            if full_len_fast:
+                seq_lens_arg = pre_w1
+            else:
+                seq_lens_arg = torch.full((B,), T, device=q.device, dtype=torch.int32)
+
+        out = torch.empty((B, T, N, D), device=q.device, dtype=q.dtype)
+        num_chunks = triton.cdiv(T, chunk_size)
+        grid = (num_chunks, B * G)
+
+        _dc_onekernel_w128_hpg4[grid](
+            q, k, v,
+            pre_w1, pre_w2, pre_dd,
+            post_w1, post_w2, post_dd,
+            out, seq_lens_arg,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            pre_w1.stride(0), pre_w1.stride(1), pre_w1.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            scaling,
+            B=B, T=T, N=N, D=D, W=W, BM=chunk_size, KL=KL, G=G, HPG=HPG,
+            FULL_LEN=full_len_fast,
+            COMBINED=True,
+            CACHE_PROBS=True,
+            NARROW_ACC=True,
+            MIXED_OUT=True,
+        )
+        return out
+
+
 class TritonDCOneKernelMixedRecompute:
     """V4HMR: mixed-output path that recomputes probs instead of caching them."""
 

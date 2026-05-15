@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -10,6 +11,7 @@
 namespace {
 
 using namespace nvcuda;
+namespace cg = cooperative_groups;
 
 constexpr int kNHeads = 32;
 constexpr int kHeadDim = 128;
@@ -20,6 +22,7 @@ constexpr int kOptBM16 = 16;
 constexpr int kOptKL256 = 256;
 constexpr int kOptWarps = 8;
 constexpr int kOptThreads = kOptWarps * kWarpSize;
+constexpr int kClusterDimX = 4;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -40,6 +43,165 @@ __device__ __forceinline__ int qkv_idx(int b, int t, int h, int d, int T) {
 
 __device__ __forceinline__ int w_idx(int b, int t, int h, int T) {
     return ((b * T + t) * kNHeads + h);
+}
+
+__global__ void cluster_dsm_smoke_kernel(float* __restrict__ out, int num_clusters) {
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    const int cluster_id = static_cast<int>(blockIdx.x) / kClusterDimX;
+
+    extern __shared__ unsigned char smem_raw[];
+    float* smem = reinterpret_cast<float*>(smem_raw);
+    if (threadIdx.x == 0) {
+        smem[0] = static_cast<float>(rank + 1);
+    }
+    cluster.sync();
+
+    if (threadIdx.x == 0 && cluster_id < num_clusters) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < kClusterDimX; ++r) {
+            float* remote = cluster.map_shared_rank(smem, r);
+            sum += remote[0];
+        }
+        out[cluster_id * kClusterDimX + rank] = sum;
+    }
+}
+
+__global__ void dc_hpg4_wide_cluster_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    const half* __restrict__ pre_w1,
+    const half* __restrict__ pre_w2,
+    const half* __restrict__ pre_dd,
+    const half* __restrict__ post_w1,
+    const half* __restrict__ post_w2,
+    const half* __restrict__ post_dd,
+    half* __restrict__ out,
+    int T,
+    int num_chunks,
+    float scaling,
+    int window,
+    int BM,
+    int KL) {
+    cg::cluster_group cluster = cg::this_cluster();
+    const int hloc = static_cast<int>(cluster.block_rank());
+    const int cluster_id = static_cast<int>(blockIdx.x) / kClusterDimX;
+    const int group = cluster_id % kG;
+    const int tmp = cluster_id / kG;
+    const int m_block = tmp % num_chunks;
+    const int b = tmp / num_chunks;
+    const int tid = threadIdx.x;
+    const int h = group * kHPG + hloc;
+    const int q_start = m_block * BM;
+    const int k_start = q_start - window + 1;
+
+    extern __shared__ unsigned char smem_raw[];
+    half* qk_tile = reinterpret_cast<half*>(smem_raw);     // [BM, KL]
+    half* probs = qk_tile + BM * KL;                       // [BM, KL]
+
+    for (int idx = tid; idx < BM * KL; idx += blockDim.x) {
+        const int m = idx / KL;
+        const int j = idx - m * KL;
+        const int qpos = q_start + m;
+        const int kpos = k_start + j;
+        float acc = 0.0f;
+        if (valid_qk(qpos, kpos, T, window)) {
+            #pragma unroll
+            for (int d = 0; d < kHeadDim; ++d) {
+                const float qv = __half2float(q[qkv_idx(b, qpos, h, d, T)]);
+                const float kv = __half2float(k[qkv_idx(b, kpos, h, d, T)]);
+                acc += qv * kv;
+            }
+            acc *= scaling;
+        }
+        qk_tile[idx] = __float2half_rn(acc);
+        probs[idx] = __float2half_rn(0.0f);
+    }
+    cluster.sync();
+
+    for (int m = tid; m < BM; m += blockDim.x) {
+        const int qpos = q_start + m;
+        float max_score = -INFINITY;
+
+        if (qpos < T) {
+            const int wi = w_idx(b, qpos, h, T);
+            const float pw2 = __half2float(pre_w2[wi]);
+            const float pdd = 1.0f + __half2float(pre_dd[wi]);
+
+            for (int j = 0; j < KL; ++j) {
+                const int kpos = k_start + j;
+                float score = -INFINITY;
+                if (valid_qk(qpos, kpos, T, window)) {
+                    float s_acc = 0.0f;
+                    #pragma unroll
+                    for (int rr = 0; rr < kClusterDimX; ++rr) {
+                        half* qk_remote = cluster.map_shared_rank(qk_tile, rr);
+                        const int h2 = group * kHPG + rr;
+                        const int wi2 = w_idx(b, qpos, h2, T);
+                        const float w1 = __half2float(pre_w1[wi2]);
+                        const float qk_val = __half2float(qk_remote[m * KL + j]);
+                        s_acc += w1 * qk_val;
+                    }
+                    const float qk_h = __half2float(qk_tile[m * KL + j]);
+                    score = pdd * qk_h + pw2 * s_acc;
+                }
+                probs[m * KL + j] = __float2half_rn(score);
+                max_score = fmaxf(max_score, score);
+            }
+
+            float denom = 0.0f;
+            for (int j = 0; j < KL; ++j) {
+                const float score = __half2float(probs[m * KL + j]);
+                const float p = isfinite(score) ? expf(score - max_score) : 0.0f;
+                probs[m * KL + j] = __float2half_rn(p);
+                denom += p;
+            }
+            const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+            for (int j = 0; j < KL; ++j) {
+                const float p = __half2float(probs[m * KL + j]) * inv_denom;
+                probs[m * KL + j] = __float2half_rn(p);
+            }
+        } else {
+            for (int j = 0; j < KL; ++j) {
+                probs[m * KL + j] = __float2half_rn(0.0f);
+            }
+        }
+    }
+    cluster.sync();
+
+    for (int idx = tid; idx < BM * kHeadDim; idx += blockDim.x) {
+        const int m = idx / kHeadDim;
+        const int d = idx - m * kHeadDim;
+        const int qpos = q_start + m;
+        if (qpos < T) {
+            const int wi = w_idx(b, qpos, h, T);
+            const float pdd = 1.0f + __half2float(post_dd[wi]);
+            const float pw2 = __half2float(post_w2[wi]);
+            float acc = 0.0f;
+
+            for (int j = 0; j < KL; ++j) {
+                const int kpos = k_start + j;
+                if (kpos >= 0 && kpos < T) {
+                    float a_acc = 0.0f;
+                    #pragma unroll
+                    for (int rr = 0; rr < kClusterDimX; ++rr) {
+                        half* p_remote = cluster.map_shared_rank(probs, rr);
+                        const int h2 = group * kHPG + rr;
+                        const int wi2 = w_idx(b, qpos, h2, T);
+                        const float w1 = __half2float(post_w1[wi2]);
+                        a_acc += w1 * __half2float(p_remote[m * KL + j]);
+                    }
+                    const float p = __half2float(probs[m * KL + j]);
+                    const float mixed = pdd * p + pw2 * a_acc;
+                    const float vv = __half2float(v[qkv_idx(b, kpos, h, d, T)]);
+                    acc += mixed * vv;
+                }
+            }
+            out[qkv_idx(b, qpos, h, d, T)] = __float2half_rn(acc);
+        }
+    }
 }
 
 __global__ void dc_hpg4_bm32_ref_kernel(
@@ -604,6 +766,109 @@ torch::Tensor forward_hpg4_wide_opt(
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
         T,
         static_cast<float>(scaling));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor forward_hpg4_wide_cluster(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor pre_w1,
+    torch::Tensor pre_w2,
+    torch::Tensor pre_dd,
+    torch::Tensor post_w1,
+    torch::Tensor post_w2,
+    torch::Tensor post_dd,
+    double scaling,
+    int64_t window,
+    int64_t chunk_size) {
+    check_fixed_inputs(
+        q, k, v, pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd, window, chunk_size);
+
+    const int B = static_cast<int>(q.size(0));
+    const int T = static_cast<int>(q.size(1));
+    const int BM = static_cast<int>(chunk_size);
+    const int KL = 256;
+    const int num_chunks = (T + BM - 1) / BM;
+    const int num_clusters = B * num_chunks * kG;
+    auto out = torch::empty_like(q);
+
+    const int threads = 256;
+    const int smem_bytes = 2 * BM * KL * static_cast<int>(sizeof(half));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        dc_hpg4_wide_cluster_kernel,
+        cudaFuncAttributeNonPortableClusterSizeAllowed,
+        1));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        dc_hpg4_wide_cluster_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
+
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(static_cast<unsigned int>(num_clusters * kClusterDimX));
+    config.blockDim = dim3(threads);
+    config.dynamicSmemBytes = smem_bytes;
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = kClusterDimX;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    C10_CUDA_CHECK(cudaLaunchKernelEx(
+        &config,
+        dc_hpg4_wide_cluster_kernel,
+        reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_w1.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_w2.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_dd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_w1.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_w2.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_dd.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        T,
+        num_chunks,
+        static_cast<float>(scaling),
+        static_cast<int>(window),
+        BM,
+        KL));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor cluster_dsm_smoke(int64_t num_clusters) {
+    TORCH_CHECK(num_clusters > 0, "num_clusters must be positive");
+    auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    auto out = torch::empty({num_clusters, kClusterDimX}, opts);
+
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        cluster_dsm_smoke_kernel,
+        cudaFuncAttributeNonPortableClusterSizeAllowed,
+        1));
+
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(static_cast<unsigned int>(num_clusters * kClusterDimX));
+    config.blockDim = dim3(32);
+    config.dynamicSmemBytes = sizeof(float);
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = kClusterDimX;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    C10_CUDA_CHECK(cudaLaunchKernelEx(
+        &config,
+        cluster_dsm_smoke_kernel,
+        out.data_ptr<float>(),
+        static_cast<int>(num_clusters)));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

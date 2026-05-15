@@ -43,9 +43,34 @@ cd ..
 CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --opt
 ```
 
-If `--opt` passes, run the isolated microbenchmark:
+Run the cluster/DSM diagnostic forward:
+
+```bash
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --cluster
+```
+
+Run the isolated microbenchmark:
 
 ```bash
 cd ..
 CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python bench_dc_hopper_cuda.py
 ```
+
+Current status: the WMMA/scalar hybrid is a negative diagnostic result. It is
+much slower than V4HCM256 on H100 and should not be optimized further.
+`forward_hpg4_wide_cluster` is the current cluster/DSM structure probe: four
+CTAs in one cluster own the four HPG heads and exchange QK/probability tiles
+through DSM. It still uses scalar inner loops, so it is a stepping stone toward
+WGMMA/TMA rather than the final performance kernel.
+
+Run the Hopper cluster/DSM smoke test:
+
+```bash
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cluster.py
+```
+
+Expected output is an `[8, 4]` tensor filled with `10.0`. This only validates
+cluster launch, synchronization, and distributed shared-memory reads; it is not
+a DC performance kernel.

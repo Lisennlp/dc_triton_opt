@@ -827,3 +827,95 @@ CUDA opt 实验入口:
 - 当前只覆盖 `BM=16,W=240,KL=256`。
 - QK 和 final `mixed @ V` 改为 CUDA WMMA tensor core，DC-pre/softmax/a_acc 仍是标量 shared-memory path。
 - 这个版本用于判断 one-CTA HPG=4 数据流是否有性能潜力；最终目标仍是 FA3-style WGMMA/TMA/warp-specialized pipeline。
+
+H100 结果:
+
+```text
+B= 8:  V4HCM256  2219us, CUDAopt  32117us, opt/V4 14.48x
+B=16:  V4HCM256  4403us, CUDAopt  64405us, opt/V4 14.63x
+B=32:  V4HCM256  8781us, CUDAopt 129554us, opt/V4 14.75x
+B=64:  V4HCM256 17545us, CUDAopt 278217us, opt/V4 15.86x
+```
+
+结论:
+- 这条 naive WMMA/scalar hybrid 路线失败，不能继续微调。
+- 性能瓶颈不是单独 QK/PV 的 tensor core 指令，而是缺少 FA3 的 TMA、warp-specialized producer/consumer overlap，以及 DC-pre/softmax/a_acc 的标量 shared-memory 串行化。
+- 后续应转向 FA3 Hopper pipeline fork 或 Hopper cluster/DSM。
+
+Cluster/DSM 入口:
+- 新增 `dc_hopper_cuda.cluster_dsm_smoke(num_clusters)`。
+- 使用 `cudaLaunchKernelEx` 和 `clusterDim.x=4`，验证 4 个 CTA 的 cluster 同步与 distributed shared memory 互读。
+- 期望输出为 `[num_clusters,4]` 全 10。
+- 这是后续把 HPG=4 的 cross-head `s_acc/a_acc` 放到 cluster 内的前置验证，不是性能 kernel。
+
+### V4HCM256N: KL=256 narrow accumulator probe
+
+假设:
+- `BM+W=256/KL=256` 的主要 Triton 压力来自 `[BM,KL]` live state 翻倍。
+- `V4HCM256` 仍保持 `s_acc/a_acc` 为 fp32；尝试把它们窄化到 fp16，减少寄存器压力和 spill 风险。
+
+实现:
+- 新增 `TritonDCOneKernelMixedProbs256Narrow`，benchmark 名称 `V4HCM256N`。
+- 仅在 `D=128,G<=8,HPG=4,KL=256,BM+W=256` 启用。
+- 数据流保持 `V4HCM256`: cache fp16 probs，final 阶段构造 `mixed=((post_dd+1)*probs + post_w2*a_acc)`，只做一次 `mixed @ V`。
+
+本地 A800 快速 sanity:
+
+```text
+Correctness vs V4HCM256:
+BM=16,W=240: max=4.6875e-02, mean=3.5015e-04
+BM=32,W=224: max=3.1250e-02, mean=3.4678e-04
+
+Short latency, B=8:
+BM=16,W=240: V4HCM256 4251us, V4HCM256N 4102us
+BM=32,W=224: V4HCM256 3443us, V4HCM256N 3426us
+```
+
+结论:
+- 这是一个低成本 H100 候选点，尤其可能帮助 `BM=16,W=240`。
+- 它不是 FA3 式优化，若 H100 上只小幅提升或持平，仍应继续转向 cluster/DSM 或 FA3 CUDA fork。
+
+H100 复测:
+
+```text
+BM=16,W=240: V4HCM256N 比 V4HCM256 慢约 2.3%
+BM=32,W=224: V4HCM256N 比 V4HCM256 慢约 3.0%
+```
+
+更新结论:
+- `V4HCM256N` 对 A800 有小收益，但 H100 退化。
+- H100 主 benchmark 已移除此列；A800 benchmark 保留，作为 A800/诊断候选。
+- 这进一步说明 H100 的瓶颈不是单纯 fp32 accumulator live state，而是缺少 FA3 式跨 CTA/WGMMA/TMA pipeline。
+
+### ClusterDiag: HPG=4 one-head-per-CTA DSM structure probe
+
+动机:
+- 当前 Triton `V4HCM/V4HCM256` 是一个 program 串行处理 HPG=4 的 4 个 head。
+- FA3 在 H100 上快的关键是把 work 分给更多 CTA/warp-group，并使用 Hopper cluster/TMA/WGMMA pipeline。
+- 下一步先验证 DC 的 cross-head 依赖能否放进 Hopper cluster: 4 个 CTA 各算一个 head，用 DSM 交换中间 tile。
+
+实现:
+- 新增 `dc_hopper_cuda.forward_hpg4_wide_cluster`。
+- 固定 `G=8,HPG=4,KL=256`，覆盖 `BM=16,W=240` 和 `BM=32,W=224`。
+- clusterDim.x=4，rank 0..3 对应同一 group 内的 4 个 head。
+- 每个 CTA:
+  1. 计算本 head 的 `qk[BM,KL]` 到本 CTA shared memory。
+  2. `cluster.sync()` 后通过 DSM 读取其他 3 个 CTA 的 `qk`，构造 DC-pre score 和本 head softmax `probs`。
+  3. 再次 `cluster.sync()` 后通过 DSM 读取其他 head 的 `probs`，构造 post `a_acc`，完成本 head 的 final mixed AV。
+
+定位:
+- 这是结构探针，不是最终性能版本；QK/softmax/final AV 仍是 scalar loop。
+- 期望它帮助验证 launch、DSM 交换、head/group/window 索引。
+- 如果 correctness 通过，下一步才把 QK/PV scalar loop 替换为 FA3/CuTe WGMMA/TMA mainloop。
+
+运行:
+
+```bash
+cd /home/lishengping/dc_triton_test/dc_triton_opt/dc_hopper_cuda
+CUDA_HOME=/usr/local/cuda-12.2 PATH=/usr/local/cuda-12.2/bin:$PATH MAX_JOBS=4 \
+  /home/lishengping/miniconda3/bin/python setup.py build_ext --inplace
+
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --cluster
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python bench_dc_hopper_cuda.py
+```

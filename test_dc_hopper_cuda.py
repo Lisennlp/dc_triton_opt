@@ -7,12 +7,19 @@ Build first on an H100 machine:
 Run:
   CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py
 
+Run the first tensor-core experiment:
+  CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --opt
+
+Run the cluster/DSM diagnostic forward:
+  CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --cluster
+
 This test intentionally focuses on KL=256 wide-window targets:
   BM=32,W=224 and BM=16,W=240.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -36,7 +43,7 @@ def make_case(B: int, T: int, dtype: torch.dtype):
     return q, k, v, ws
 
 
-def check(B: int, T: int, BM: int, W: int):
+def check(B: int, T: int, BM: int, W: int, use_opt: bool = False, use_cluster: bool = False):
     import dc_hopper_cuda
 
     dtype = torch.float16
@@ -50,28 +57,79 @@ def check(B: int, T: int, BM: int, W: int):
         q, k, v, ws, scaling, W, None, G=8, chunk_size=BM
     )
 
-    got = dc_hopper_cuda.forward_hpg4_wide_ref(
-        q,
-        k,
-        v,
-        pre_w1,
-        pre_w2,
-        pre_dd,
-        post_w1,
-        post_w2,
-        post_dd,
-        scaling,
-        W,
-        BM,
-    )
+    if use_cluster:
+        try:
+            got = dc_hopper_cuda.forward_hpg4_wide_cluster(
+                q,
+                k,
+                v,
+                pre_w1,
+                pre_w2,
+                pre_dd,
+                post_w1,
+                post_w2,
+                post_dd,
+                scaling,
+                W,
+                BM,
+            )
+        except Exception as exc:
+            print(f"CLUSTER B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: ERROR {type(exc).__name__}: {exc}")
+            return False
+        max_limit = 1.2e-1
+        mean_limit = 1.0e-3
+        label = "CLUSTER"
+    elif use_opt:
+        if not (BM == 16 and W == 240):
+            print(f"B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: SKIP opt")
+            return True
+        try:
+            got = dc_hopper_cuda.forward_hpg4_wide_opt(
+                q,
+                k,
+                v,
+                pre_w1,
+                pre_w2,
+                pre_dd,
+                post_w1,
+                post_w2,
+                post_dd,
+                scaling,
+                W,
+                BM,
+            )
+        except Exception as exc:
+            print(f"OPT B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: ERROR {type(exc).__name__}: {exc}")
+            return False
+        max_limit = 2.0e-1
+        mean_limit = 2.0e-3
+        label = "OPT"
+    else:
+        got = dc_hopper_cuda.forward_hpg4_wide_ref(
+            q,
+            k,
+            v,
+            pre_w1,
+            pre_w2,
+            pre_dd,
+            post_w1,
+            post_w2,
+            post_dd,
+            scaling,
+            W,
+            BM,
+        )
+        max_limit = 1.2e-1
+        mean_limit = 1.0e-3
+        label = "REF"
     torch.cuda.synchronize()
 
     diff = (got.float() - ref.float()).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
-    passed = mean_diff <= 1.0e-3 and max_diff <= 1.2e-1
+    passed = mean_diff <= mean_limit and max_diff <= max_limit
     print(
-        f"B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: "
+        f"{label} B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: "
         f"max={max_diff:.4e} mean={mean_diff:.4e} "
         f"{'PASS' if passed else 'FAIL'}"
     )
@@ -79,6 +137,21 @@ def check(B: int, T: int, BM: int, W: int):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--opt",
+        action="store_true",
+        help="test the experimental tensor-core opt path; currently BM=16,W=240 only",
+    )
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="test the Hopper cluster/DSM diagnostic forward",
+    )
+    args = parser.parse_args()
+    if args.opt and args.cluster:
+        raise ValueError("--opt and --cluster are mutually exclusive")
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     major, minor = torch.cuda.get_device_capability()
@@ -88,7 +161,7 @@ def main():
     all_passed = True
     for B in (1, 2):
         for T, BM, W in ((256, 32, 224), (512, 32, 224), (256, 16, 240), (512, 16, 240)):
-            all_passed = check(B, T, BM, W) and all_passed
+            all_passed = check(B, T, BM, W, use_opt=args.opt, use_cluster=args.cluster) and all_passed
     if not all_passed:
         raise RuntimeError("dc_hopper_cuda correctness gate failed")
 
