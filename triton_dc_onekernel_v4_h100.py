@@ -81,6 +81,127 @@ def _consume_qk(
     return a_acc
 
 
+@triton.jit
+def _accumulate_qk_only(
+    qk, s_acc, a_acc, valid,
+    b, q_offs, q_mask, ni,
+    PRE_W2, PRE_DD, POST_W1,
+    stride_wb, stride_wt, stride_wn,
+):
+    qk_f = qk.to(tl.float32)
+    pw2 = tl.load(PRE_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    pdd = tl.load(PRE_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                  mask=q_mask, other=0.0).to(tl.float32)
+
+    score = (pdd + 1.0)[:, None] * qk_f + pw2[:, None] * s_acc
+    score = tl.where(valid, score, float("-inf"))
+    rm = tl.max(score, axis=1)
+    p = tl.exp2((score - rm[:, None]) * LOG2E)
+    p = tl.where(valid, p, 0.0)
+    rs = tl.sum(p, axis=1)
+    sl = tl.where(rs > 0.0, rs, 1.0)
+    probs = p / sl[:, None]
+
+    pw1p = tl.load(POST_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    return a_acc + pw1p[:, None] * probs
+
+
+@triton.jit
+def _compute_probs_accumulate(
+    qk, s_acc, a_acc, valid,
+    b, q_offs, q_mask, ni,
+    PRE_W2, PRE_DD, POST_W1,
+    stride_wb, stride_wt, stride_wn,
+):
+    qk_f = qk.to(tl.float32)
+    pw2 = tl.load(PRE_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    pdd = tl.load(PRE_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                  mask=q_mask, other=0.0).to(tl.float32)
+
+    score = (pdd + 1.0)[:, None] * qk_f + pw2[:, None] * s_acc
+    score = tl.where(valid, score, float("-inf"))
+    rm = tl.max(score, axis=1)
+    p = tl.exp2((score - rm[:, None]) * LOG2E)
+    p = tl.where(valid, p, 0.0)
+    rs = tl.sum(p, axis=1)
+    sl = tl.where(rs > 0.0, rs, 1.0)
+    probs = p / sl[:, None]
+
+    pw1p = tl.load(POST_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    return a_acc + pw1p[:, None] * probs, probs.to(tl.float16)
+
+
+@triton.jit
+def _store_combined_qk(
+    qk, s_acc, a_acc, valid,
+    b, q_offs, k_offs, q_mask, k_mask, d_offs, ni,
+    PRE_W2, PRE_DD, POST_DD, POST_W2,
+    V, OUT,
+    stride_wb, stride_wt, stride_wn,
+    stride_vb, stride_vt, stride_vn, stride_vd,
+    stride_ob, stride_ot, stride_on, stride_od,
+):
+    qk_f = qk.to(tl.float32)
+    pw2 = tl.load(PRE_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    pdd = tl.load(PRE_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                  mask=q_mask, other=0.0).to(tl.float32)
+
+    score = (pdd + 1.0)[:, None] * qk_f + pw2[:, None] * s_acc
+    score = tl.where(valid, score, float("-inf"))
+    rm = tl.max(score, axis=1)
+    p = tl.exp2((score - rm[:, None]) * LOG2E)
+    p = tl.where(valid, p, 0.0)
+    rs = tl.sum(p, axis=1)
+    sl = tl.where(rs > 0.0, rs, 1.0)
+    probs = p / sl[:, None]
+
+    v_ptrs = (V + b * stride_vb + k_offs[:, None].to(tl.int64) * stride_vt
+              + ni * stride_vn + d_offs[None, :].to(tl.int64) * stride_vd)
+    v_blk = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
+    pv = tl.dot(probs.to(v_blk.dtype), v_blk)
+    av = tl.dot(a_acc.to(v_blk.dtype), v_blk)
+
+    pddp = tl.load(POST_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    pw2p = tl.load(POST_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    o_ptrs = (OUT + b * stride_ob + q_offs[:, None].to(tl.int64) * stride_ot
+              + ni * stride_on + d_offs[None, :].to(tl.int64) * stride_od)
+    out = (pddp[:, None] + 1.0) * pv + pw2p[:, None] * av
+    tl.store(o_ptrs, out, mask=q_mask[:, None])
+
+
+@triton.jit
+def _store_combined_probs(
+    probs, a_acc_h,
+    b, q_offs, k_offs, q_mask, k_mask, d_offs, ni,
+    POST_DD, POST_W2,
+    V, OUT,
+    stride_wb, stride_wt, stride_wn,
+    stride_vb, stride_vt, stride_vn, stride_vd,
+    stride_ob, stride_ot, stride_on, stride_od,
+):
+    v_ptrs = (V + b * stride_vb + k_offs[:, None].to(tl.int64) * stride_vt
+              + ni * stride_vn + d_offs[None, :].to(tl.int64) * stride_vd)
+    v_blk = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
+    pv = tl.dot(probs, v_blk)
+    av = tl.dot(a_acc_h, v_blk)
+
+    pddp = tl.load(POST_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    pw2p = tl.load(POST_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                   mask=q_mask, other=0.0).to(tl.float32)
+    o_ptrs = (OUT + b * stride_ob + q_offs[:, None].to(tl.int64) * stride_ot
+              + ni * stride_on + d_offs[None, :].to(tl.int64) * stride_od)
+    out = (pddp[:, None] + 1.0) * pv + pw2p[:, None] * av
+    tl.store(o_ptrs, out, mask=q_mask[:, None])
+
+
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4, num_stages=1),
@@ -429,7 +550,7 @@ def _dc_onekernel_cache4(
         triton.Config({}, num_warps=8, num_stages=1),
         triton.Config({}, num_warps=8, num_stages=2),
     ],
-    key=["B", "T", "N", "D", "W", "BM", "KL", "G", "HPG"],
+    key=["B", "T", "N", "D", "W", "BM", "KL", "G", "HPG", "FULL_LEN", "COMBINED", "CACHE_PROBS"],
 )
 @triton.jit
 def _dc_onekernel_w128_hpg4(
@@ -446,6 +567,7 @@ def _dc_onekernel_w128_hpg4(
     B: tl.constexpr, T: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
     W: tl.constexpr, BM: tl.constexpr, KL: tl.constexpr,
     G: tl.constexpr, HPG: tl.constexpr, FULL_LEN: tl.constexpr,
+    COMBINED: tl.constexpr, CACHE_PROBS: tl.constexpr,
 ):
     pid_c = tl.program_id(0)
     pid_bg = tl.program_id(1)
@@ -512,39 +634,111 @@ def _dc_onekernel_w128_hpg4(
     qk3 = qk3.to(tl.float16)
 
     a_acc = tl.zeros([BM, 128], dtype=tl.float32)
-    a_acc = _consume_qk(qk0, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
-                        PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
-                        stride_wb, stride_wt, stride_wn,
-                        stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od)
-    a_acc = _consume_qk(qk1, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
-                        PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
-                        stride_wb, stride_wt, stride_wn,
-                        stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od)
-    a_acc = _consume_qk(qk2, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
-                        PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
-                        stride_wb, stride_wt, stride_wn,
-                        stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od)
-    a_acc = _consume_qk(qk3, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
-                        PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
-                        stride_wb, stride_wt, stride_wn,
-                        stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od)
+    if COMBINED:
+        if CACHE_PROBS:
+            a_acc, probs0 = _compute_probs_accumulate(qk0, s_acc, a_acc, valid, b, q_offs, q_mask, n0,
+                                                      PRE_W2, PRE_DD, POST_W1,
+                                                      stride_wb, stride_wt, stride_wn)
+            a_acc, probs1 = _compute_probs_accumulate(qk1, s_acc, a_acc, valid, b, q_offs, q_mask, n1,
+                                                      PRE_W2, PRE_DD, POST_W1,
+                                                      stride_wb, stride_wt, stride_wn)
+            a_acc, probs2 = _compute_probs_accumulate(qk2, s_acc, a_acc, valid, b, q_offs, q_mask, n2,
+                                                      PRE_W2, PRE_DD, POST_W1,
+                                                      stride_wb, stride_wt, stride_wn)
+            a_acc, probs3 = _compute_probs_accumulate(qk3, s_acc, a_acc, valid, b, q_offs, q_mask, n3,
+                                                      PRE_W2, PRE_DD, POST_W1,
+                                                      stride_wb, stride_wt, stride_wn)
+            a_acc_h = a_acc.to(tl.float16)
+            _store_combined_probs(probs0, a_acc_h, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
+                                  POST_DD, POST_W2, V, OUT,
+                                  stride_wb, stride_wt, stride_wn,
+                                  stride_vb, stride_vt, stride_vn, stride_vd,
+                                  stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_probs(probs1, a_acc_h, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
+                                  POST_DD, POST_W2, V, OUT,
+                                  stride_wb, stride_wt, stride_wn,
+                                  stride_vb, stride_vt, stride_vn, stride_vd,
+                                  stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_probs(probs2, a_acc_h, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
+                                  POST_DD, POST_W2, V, OUT,
+                                  stride_wb, stride_wt, stride_wn,
+                                  stride_vb, stride_vt, stride_vn, stride_vd,
+                                  stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_probs(probs3, a_acc_h, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
+                                  POST_DD, POST_W2, V, OUT,
+                                  stride_wb, stride_wt, stride_wn,
+                                  stride_vb, stride_vt, stride_vn, stride_vd,
+                                  stride_ob, stride_ot, stride_on, stride_od)
+        else:
+            a_acc = _accumulate_qk_only(qk0, s_acc, a_acc, valid, b, q_offs, q_mask, n0,
+                                        PRE_W2, PRE_DD, POST_W1,
+                                        stride_wb, stride_wt, stride_wn)
+            a_acc = _accumulate_qk_only(qk1, s_acc, a_acc, valid, b, q_offs, q_mask, n1,
+                                        PRE_W2, PRE_DD, POST_W1,
+                                        stride_wb, stride_wt, stride_wn)
+            a_acc = _accumulate_qk_only(qk2, s_acc, a_acc, valid, b, q_offs, q_mask, n2,
+                                        PRE_W2, PRE_DD, POST_W1,
+                                        stride_wb, stride_wt, stride_wn)
+            a_acc = _accumulate_qk_only(qk3, s_acc, a_acc, valid, b, q_offs, q_mask, n3,
+                                        PRE_W2, PRE_DD, POST_W1,
+                                        stride_wb, stride_wt, stride_wn)
 
-    for h in range(4):
-        ni = (head_start + h).to(tl.int64)
-        v_ptrs = (V + b * stride_vb + k_offs[:, None].to(tl.int64) * stride_vt
-                  + ni * stride_vn + d_offs[None, :].to(tl.int64) * stride_vd)
-        v_blk = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
-        av = tl.dot(a_acc.to(v_blk.dtype), v_blk)
-        pw2p = tl.load(POST_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
-                        mask=q_mask, other=0.0).to(tl.float32)
-        o_ptrs = (OUT + b * stride_ob + q_offs[:, None].to(tl.int64) * stride_ot
-                  + ni * stride_on + d_offs[None, :].to(tl.int64) * stride_od)
-        o_prev = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
-        tl.store(o_ptrs, o_prev + pw2p[:, None] * av, mask=q_mask[:, None])
+            a_acc_h = a_acc.to(tl.float16)
+            _store_combined_qk(qk0, s_acc, a_acc_h, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
+                               PRE_W2, PRE_DD, POST_DD, POST_W2, V, OUT,
+                               stride_wb, stride_wt, stride_wn,
+                               stride_vb, stride_vt, stride_vn, stride_vd,
+                               stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_qk(qk1, s_acc, a_acc_h, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
+                               PRE_W2, PRE_DD, POST_DD, POST_W2, V, OUT,
+                               stride_wb, stride_wt, stride_wn,
+                               stride_vb, stride_vt, stride_vn, stride_vd,
+                               stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_qk(qk2, s_acc, a_acc_h, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
+                               PRE_W2, PRE_DD, POST_DD, POST_W2, V, OUT,
+                               stride_wb, stride_wt, stride_wn,
+                               stride_vb, stride_vt, stride_vn, stride_vd,
+                               stride_ob, stride_ot, stride_on, stride_od)
+            _store_combined_qk(qk3, s_acc, a_acc_h, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
+                               PRE_W2, PRE_DD, POST_DD, POST_W2, V, OUT,
+                               stride_wb, stride_wt, stride_wn,
+                               stride_vb, stride_vt, stride_vn, stride_vd,
+                               stride_ob, stride_ot, stride_on, stride_od)
+    else:
+        a_acc = _consume_qk(qk0, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
+                            PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                            stride_wb, stride_wt, stride_wn,
+                            stride_vb, stride_vt, stride_vn, stride_vd,
+                            stride_ob, stride_ot, stride_on, stride_od)
+        a_acc = _consume_qk(qk1, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
+                            PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                            stride_wb, stride_wt, stride_wn,
+                            stride_vb, stride_vt, stride_vn, stride_vd,
+                            stride_ob, stride_ot, stride_on, stride_od)
+        a_acc = _consume_qk(qk2, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
+                            PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                            stride_wb, stride_wt, stride_wn,
+                            stride_vb, stride_vt, stride_vn, stride_vd,
+                            stride_ob, stride_ot, stride_on, stride_od)
+        a_acc = _consume_qk(qk3, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
+                            PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                            stride_wb, stride_wt, stride_wn,
+                            stride_vb, stride_vt, stride_vn, stride_vd,
+                            stride_ob, stride_ot, stride_on, stride_od)
+
+        a_acc_h = a_acc.to(tl.float16)
+        for h in range(4):
+            ni = (head_start + h).to(tl.int64)
+            v_ptrs = (V + b * stride_vb + k_offs[:, None].to(tl.int64) * stride_vt
+                      + ni * stride_vn + d_offs[None, :].to(tl.int64) * stride_vd)
+            v_blk = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
+            av = tl.dot(a_acc_h, v_blk)
+            pw2p = tl.load(POST_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                            mask=q_mask, other=0.0).to(tl.float32)
+            o_ptrs = (OUT + b * stride_ob + q_offs[:, None].to(tl.int64) * stride_ot
+                      + ni * stride_on + d_offs[None, :].to(tl.int64) * stride_od)
+            o_prev = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
+            tl.store(o_ptrs, o_prev + pw2p[:, None] * av, mask=q_mask[:, None])
 
 
 class TritonDCOneKernel:
@@ -599,6 +793,8 @@ class TritonDCOneKernel:
                 scaling,
                 B=B, T=T, N=N, D=D, W=W, BM=chunk_size, KL=KL, G=G, HPG=HPG,
                 FULL_LEN=full_len_fast,
+                COMBINED=False,
+                CACHE_PROBS=False,
             )
             return out
 
@@ -614,5 +810,117 @@ class TritonDCOneKernel:
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             scaling,
             B=B, T=T, N=N, D=D, W=W, BM=chunk_size, KL=KL, G=G, HPG=HPG,
+        )
+        return out
+
+
+class TritonDCOneKernelCombined:
+    """V4HC: HPG=4/W+BM=128 experiment that stores OUT only once."""
+
+    @staticmethod
+    def forward(
+        q, k, v, dc_weights, scaling, window,
+        seq_lens=None, G=16, chunk_size=16,
+    ):
+        pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd = dc_weights
+        B, T, N, D = q.shape
+        W = min(int(window), T)
+        HPG = N // G
+        assert N % G == 0
+        assert HPG >= 2 and HPG % 2 == 0, f"HPG={HPG} must be even and >= 2"
+
+        KSPAN = chunk_size + W - 1
+        KL = triton.next_power_of_2(KSPAN)
+        if not (D == 128 and G <= 8 and HPG == 4 and KL == 128 and chunk_size + W == 128):
+            return TritonDCOneKernel.forward(q, k, v, dc_weights, scaling, window, seq_lens, G=G, chunk_size=chunk_size)
+
+        full_len_fast = seq_lens is None and T % chunk_size == 0 and T >= chunk_size + W
+
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+        pre_w1 = pre_w1.contiguous(); pre_w2 = pre_w2.contiguous()
+        pre_dd = pre_dd.contiguous(); post_w1 = post_w1.contiguous()
+        post_w2 = post_w2.contiguous(); post_dd = post_dd.contiguous()
+        seq_lens_arg = seq_lens
+        if seq_lens_arg is None:
+            if full_len_fast:
+                seq_lens_arg = pre_w1
+            else:
+                seq_lens_arg = torch.full((B,), T, device=q.device, dtype=torch.int32)
+
+        out = torch.empty((B, T, N, D), device=q.device, dtype=q.dtype)
+        num_chunks = triton.cdiv(T, chunk_size)
+        grid = (num_chunks, B * G)
+
+        _dc_onekernel_w128_hpg4[grid](
+            q, k, v,
+            pre_w1, pre_w2, pre_dd,
+            post_w1, post_w2, post_dd,
+            out, seq_lens_arg,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            pre_w1.stride(0), pre_w1.stride(1), pre_w1.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            scaling,
+            B=B, T=T, N=N, D=D, W=W, BM=chunk_size, KL=KL, G=G, HPG=HPG,
+            FULL_LEN=full_len_fast,
+            COMBINED=True,
+            CACHE_PROBS=False,
+        )
+        return out
+
+
+class TritonDCOneKernelCombinedProbs:
+    """V4HCP: V4HC plus cached per-head probabilities to avoid repeated softmax."""
+
+    @staticmethod
+    def forward(
+        q, k, v, dc_weights, scaling, window,
+        seq_lens=None, G=16, chunk_size=16,
+    ):
+        pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd = dc_weights
+        B, T, N, D = q.shape
+        W = min(int(window), T)
+        HPG = N // G
+        assert N % G == 0
+        assert HPG >= 2 and HPG % 2 == 0, f"HPG={HPG} must be even and >= 2"
+
+        KSPAN = chunk_size + W - 1
+        KL = triton.next_power_of_2(KSPAN)
+        if not (D == 128 and G <= 8 and HPG == 4 and KL == 128 and chunk_size + W == 128):
+            return TritonDCOneKernelCombined.forward(q, k, v, dc_weights, scaling, window, seq_lens, G=G, chunk_size=chunk_size)
+
+        full_len_fast = seq_lens is None and T % chunk_size == 0 and T >= chunk_size + W
+
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+        pre_w1 = pre_w1.contiguous(); pre_w2 = pre_w2.contiguous()
+        pre_dd = pre_dd.contiguous(); post_w1 = post_w1.contiguous()
+        post_w2 = post_w2.contiguous(); post_dd = post_dd.contiguous()
+        seq_lens_arg = seq_lens
+        if seq_lens_arg is None:
+            if full_len_fast:
+                seq_lens_arg = pre_w1
+            else:
+                seq_lens_arg = torch.full((B,), T, device=q.device, dtype=torch.int32)
+
+        out = torch.empty((B, T, N, D), device=q.device, dtype=q.dtype)
+        num_chunks = triton.cdiv(T, chunk_size)
+        grid = (num_chunks, B * G)
+
+        _dc_onekernel_w128_hpg4[grid](
+            q, k, v,
+            pre_w1, pre_w2, pre_dd,
+            post_w1, post_w2, post_dd,
+            out, seq_lens_arg,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            pre_w1.stride(0), pre_w1.stride(1), pre_w1.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            scaling,
+            B=B, T=T, N=N, D=D, W=W, BM=chunk_size, KL=KL, G=G, HPG=HPG,
+            FULL_LEN=full_len_fast,
+            COMBINED=True,
+            CACHE_PROBS=True,
         )
         return out
