@@ -1,9 +1,15 @@
-"""Single-kernel DC v4.
+"""Single-kernel DC v5.
 
-Targeted change vs v3:
-- For G<=8 / 4<=HPG<=8 / KL<=128, cache the last four QK matrices in the group.
-- Sweep 2 consumes those cached four heads without re-reading Q/K.
-- The remaining heads are recomputed in pairs, matching the v3 structure.
+Targeted change vs v4:
+- For HPG=4, keep V4's cache-four-QK structure.
+- For HPG=8, cache all eight QK matrices as fp16 and remove Sweep 2 QK
+  recomputation entirely for that group.
+- For other supported HPG values, keep the cache-four structure.
+- Cache live QK matrices as fp16 after they have contributed to the fp32
+  pre-aggregation. The HPG=4/6 path keeps four cached matrices; the HPG=8
+  path caches all eight matrices in one static branch.
+- Compute the causal/window validity mask once per CTA and reuse it for every
+  cached/recomputed head.
 
 HPG<4, HPG>8, G>8 and KL>128 deliberately fall back to v3. This avoids
 touching the HPG=2 path, avoids large-HPG register regressions, and avoids the
@@ -37,25 +43,21 @@ def _load_qk(
 
 @triton.jit
 def _consume_qk(
-    qk, s_acc, a_acc,
+    qk, s_acc, a_acc, valid,
     b, q_offs, k_offs, q_mask, k_mask, d_offs, ni,
     PRE_W2, PRE_DD, POST_W1, POST_DD,
     V, OUT,
     stride_wb, stride_wt, stride_wn,
     stride_vb, stride_vt, stride_vn, stride_vd,
     stride_ob, stride_ot, stride_on, stride_od,
-    W: tl.constexpr,
 ):
-    causal = k_offs[None, :] <= q_offs[:, None]
-    win = (q_offs[:, None] - k_offs[None, :]) < W
-    valid = causal & win & q_mask[:, None] & k_mask[None, :]
-
+    qk_f = qk.to(tl.float32)
     pw2 = tl.load(PRE_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
                    mask=q_mask, other=0.0).to(tl.float32)
     pdd = tl.load(PRE_DD + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
                   mask=q_mask, other=0.0).to(tl.float32)
 
-    score = (pdd + 1.0)[:, None] * qk + pw2[:, None] * s_acc
+    score = (pdd + 1.0)[:, None] * qk_f + pw2[:, None] * s_acc
     score = tl.where(valid, score, float("-inf"))
     rm = tl.max(score, axis=1)
     p = tl.exp2((score - rm[:, None]) * LOG2E)
@@ -127,6 +129,141 @@ def _dc_onekernel_cache4(
         k_start = 0
     k_offs = k_start + kl_offs
     k_mask = (k_offs < T) & (k_offs >= 0) & (k_offs < seq_len) & (kl_offs < (BM + W - 1))
+    causal = k_offs[None, :] <= q_offs[:, None]
+    win = (q_offs[:, None] - k_offs[None, :]) < W
+    valid = causal & win & q_mask[:, None] & k_mask[None, :]
+
+    if HPG == 8:
+        n0 = head_start.to(tl.int64)
+        n1 = (head_start + 1).to(tl.int64)
+        n2 = (head_start + 2).to(tl.int64)
+        n3 = (head_start + 3).to(tl.int64)
+        n4 = (head_start + 4).to(tl.int64)
+        n5 = (head_start + 5).to(tl.int64)
+        n6 = (head_start + 6).to(tl.int64)
+        n7 = (head_start + 7).to(tl.int64)
+
+        s_acc8 = tl.zeros([BM, KL], dtype=tl.float32)
+
+        qk0 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_0 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n0 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_0[:, None] * qk0
+        qk0 = qk0.to(tl.float16)
+
+        qk1 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_1 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n1 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_1[:, None] * qk1
+        qk1 = qk1.to(tl.float16)
+
+        qk2 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_2 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n2 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_2[:, None] * qk2
+        qk2 = qk2.to(tl.float16)
+
+        qk3 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_3 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n3 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_3[:, None] * qk3
+        qk3 = qk3.to(tl.float16)
+
+        qk4 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n4,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_4 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n4 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_4[:, None] * qk4
+        qk4 = qk4.to(tl.float16)
+
+        qk5 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n5,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_5 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n5 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_5[:, None] * qk5
+        qk5 = qk5.to(tl.float16)
+
+        qk6 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n6,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_6 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n6 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_6[:, None] * qk6
+        qk6 = qk6.to(tl.float16)
+
+        qk7 = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, n7,
+                       stride_qb, stride_qt, stride_qn, stride_qd,
+                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
+        pw1_7 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n7 * stride_wn,
+                        mask=q_mask, other=0.0).to(tl.float32)
+        s_acc8 += pw1_7[:, None] * qk7
+        qk7 = qk7.to(tl.float16)
+
+        a_acc8 = tl.zeros([BM, KL], dtype=tl.float32)
+        a_acc8 = _consume_qk(qk0, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n0,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk1, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n1,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk2, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n2,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk3, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n3,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk4, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n4,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk5, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n5,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk6, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n6,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+        a_acc8 = _consume_qk(qk7, s_acc8, a_acc8, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n7,
+                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
+                             stride_wb, stride_wt, stride_wn,
+                             stride_vb, stride_vt, stride_vn, stride_vd,
+                             stride_ob, stride_ot, stride_on, stride_od)
+
+        for h in range(8):
+            ni = (head_start + h).to(tl.int64)
+            v_ptrs = (V + b * stride_vb + k_offs[:, None].to(tl.int64) * stride_vt
+                      + ni * stride_vn + d_offs[None, :].to(tl.int64) * stride_vd)
+            v_blk = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
+            av = tl.dot(a_acc8.to(v_blk.dtype), v_blk)
+            pw2p = tl.load(POST_W2 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + ni * stride_wn,
+                            mask=q_mask, other=0.0).to(tl.float32)
+            o_ptrs = (OUT + b * stride_ob + q_offs[:, None].to(tl.int64) * stride_ot
+                      + ni * stride_on + d_offs[None, :].to(tl.int64) * stride_od)
+            o_prev = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
+            tl.store(o_ptrs, (o_prev + pw2p[:, None] * av), mask=q_mask[:, None])
+        return
 
     num_pairs = HPG // 2
     s_acc = tl.zeros([BM, KL], dtype=tl.float32)
@@ -170,37 +307,41 @@ def _dc_onekernel_cache4(
     pw1_c0 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n_c0 * stride_wn,
                      mask=q_mask, other=0.0).to(tl.float32)
     s_acc += pw1_c0[:, None] * qk_c0
+    qk_c0 = qk_c0.to(tl.float16)
     pw1_c1 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n_c1 * stride_wn,
                      mask=q_mask, other=0.0).to(tl.float32)
     s_acc += pw1_c1[:, None] * qk_c1
+    qk_c1 = qk_c1.to(tl.float16)
     pw1_l0 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n_l0 * stride_wn,
                      mask=q_mask, other=0.0).to(tl.float32)
     s_acc += pw1_l0[:, None] * qk_l0
+    qk_l0 = qk_l0.to(tl.float16)
     pw1_l1 = tl.load(PRE_W1 + b * stride_wb + q_offs.to(tl.int64) * stride_wt + n_l1 * stride_wn,
                      mask=q_mask, other=0.0).to(tl.float32)
     s_acc += pw1_l1[:, None] * qk_l1
+    qk_l1 = qk_l1.to(tl.float16)
 
     a_acc = tl.zeros([BM, KL], dtype=tl.float32)
-    a_acc = _consume_qk(qk_l0, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_l0,
+    a_acc = _consume_qk(qk_l0, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_l0,
                         PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                         stride_wb, stride_wt, stride_wn,
                         stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od, W)
-    a_acc = _consume_qk(qk_l1, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_l1,
+                        stride_ob, stride_ot, stride_on, stride_od)
+    a_acc = _consume_qk(qk_l1, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_l1,
                         PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                         stride_wb, stride_wt, stride_wn,
                         stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od, W)
-    a_acc = _consume_qk(qk_c0, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_c0,
+                        stride_ob, stride_ot, stride_on, stride_od)
+    a_acc = _consume_qk(qk_c0, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_c0,
                         PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                         stride_wb, stride_wt, stride_wn,
                         stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od, W)
-    a_acc = _consume_qk(qk_c1, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_c1,
+                        stride_ob, stride_ot, stride_on, stride_od)
+    a_acc = _consume_qk(qk_c1, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, n_c1,
                         PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                         stride_wb, stride_wt, stride_wn,
                         stride_vb, stride_vt, stride_vn, stride_vd,
-                        stride_ob, stride_ot, stride_on, stride_od, W)
+                        stride_ob, stride_ot, stride_on, stride_od)
 
     for pair_idx in range(num_pairs - 2):
         ni0 = (head_start + pair_idx * 2).to(tl.int64)
@@ -208,19 +349,19 @@ def _dc_onekernel_cache4(
         qk = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni0,
                       stride_qb, stride_qt, stride_qn, stride_qd,
                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
-        a_acc = _consume_qk(qk, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni0,
+        a_acc = _consume_qk(qk, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni0,
                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                             stride_wb, stride_wt, stride_wn,
                             stride_vb, stride_vt, stride_vn, stride_vd,
-                            stride_ob, stride_ot, stride_on, stride_od, W)
+                            stride_ob, stride_ot, stride_on, stride_od)
         qk = _load_qk(Q, K, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni1,
                       stride_qb, stride_qt, stride_qn, stride_qd,
                       stride_kb, stride_kt, stride_kn, stride_kd, scaling)
-        a_acc = _consume_qk(qk, s_acc, a_acc, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni1,
+        a_acc = _consume_qk(qk, s_acc, a_acc, valid, b, q_offs, k_offs, q_mask, k_mask, d_offs, ni1,
                             PRE_W2, PRE_DD, POST_W1, POST_DD, V, OUT,
                             stride_wb, stride_wt, stride_wn,
                             stride_vb, stride_vt, stride_vn, stride_vd,
-                            stride_ob, stride_ot, stride_on, stride_od, W)
+                            stride_ob, stride_ot, stride_on, stride_od)
 
     for h in range(HPG):
         ni = (head_start + h).to(tl.int64)
@@ -237,7 +378,7 @@ def _dc_onekernel_cache4(
 
 
 class TritonDCOneKernel:
-    """V4: G<=8/4<=HPG<=8/KL<=128 cache-four-QK specialization; otherwise v3."""
+    """V5: fp16 cached QK, cache8 for HPG=8, and hoisted validity mask."""
 
     @staticmethod
     def forward(

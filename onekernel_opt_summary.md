@@ -353,3 +353,278 @@ B  BM    W   G  HPG |       V0       V1       V2       V3       V4       4k     
  64  16  240   2   16 |   89426u   74008u       0u   51730u   51817u  101303u   24684u   13541u |   3.82x   3.83x   1.00x   7.48x   1.82x
  64  16  240   4    8 |   91390u   75581u       0u   52430u   52419u   99370u   25492u   13541u |   3.87x   3.87x   1.00x   7.34x   1.88x
  64  16  240   8    4 |   96384u   87428u       0u   50998u   50984u  102466u   27083u   13541u |   3.77x   3.77x   1.00x   7.57x   2.00x
+
+## V5: fp16 cached QK + HPG=8 cache8 + hoisted valid mask
+
+文件: `triton_dc_onekernel_v5.py`
+
+V5 在 V4 cache-four-QK specialization 上继续做实验优化。整体仍然是一套 forward/一份 kernel 文件，`HPG` 是 `tl.constexpr`，因此 Triton 会在编译期选择分支:
+- `HPG=4/6`: 继续使用 V4 的 cache4 结构
+- `HPG=8`: 使用 cache8 分支，把 8 个 head 的 QK 都以 fp16 缓存下来，Sweep 2 不再重算 QK
+
+适用范围保持与 V4 fast path 一致:
+- `G <= 8`
+- `4 <= HPG <= 8` 且 `HPG` 为偶数
+- `KL = next_power_of_2(chunk_size + W - 1) <= 128`
+- 其他情况继续 fallback 到 V3，避免影响 `HPG=2` 和 `KL=256` 路径
+
+### 优化点
+
+1. cached QK 从 fp32 live matrix 改成 fp16 live matrix，并对 `HPG=8` 尝试 cache8。
+
+V4 会缓存最后 4 个 head 的 QK，用于 Sweep 2 免重算。原实现中这 4 个 QK 都是 `tl.dot` 输出的 fp32 tensor，并且一直 live 到 softmax/PV 阶段。V5 在每个 cached QK 完成 `s_acc += pre_w1 * qk` 之后立即转成 fp16:
+
+```python
+qk_c0 = qk_c0.to(tl.float16)
+qk_c1 = qk_c1.to(tl.float16)
+qk_l0 = qk_l0.to(tl.float16)
+qk_l1 = qk_l1.to(tl.float16)
+```
+
+`s_acc` 仍然保持 fp32，因此 pre-aggregation 不降精度。Sweep 2 消费 QK 时再转回 fp32 参与 score:
+
+```python
+qk_f = qk.to(tl.float32)
+score = (pdd + 1.0)[:, None] * qk_f + pw2[:, None] * s_acc
+```
+
+动机是降低 register pressure。V4 cache4 的主要压力来自同时持有:
+- `s_acc [BM, KL] fp32`
+- `a_acc [BM, KL] fp32`
+- 4 个 cached `qk [BM, KL] fp32`
+
+将 cache4 的 cached QK 改为 fp16 不改变理论 dot 数量，只降低 live state 和 register/local memory 压力。由于 QK 本身来自 fp16 Q/K 的 tensor-core dot，且 softmax 前仍会转 fp32 参与 score，这个改动的精度风险比把 `s_acc` 或 `a_acc` 改 fp16 小。
+
+对 `HPG=8`，V5 进一步增加一个静态 cache8 分支:
+- Sweep 1 计算 8 个 QK，并全部累加到 fp32 `s_acc8`
+- 每个 QK 累加后立即转 fp16 缓存
+- Sweep 2 直接消费 8 个 cached QK，不再重算前 4 个 head 的 QK
+
+理论 dot 数量上，`HPG=8` 的 cache4 路径需要 `8 QK + 4 recomputed QK + 8 PV + 8 AV = 28` 次 `[BM, KL] x [KL, D]` 等价 dot；cache8 路径变成 `8 QK + 8 PV + 8 AV = 24` 次，理论计算项从 `1.75 * KL/W` 降到 `1.50 * KL/W`。但 cache8 同时让 8 个 fp16 QK matrix live 到 Sweep 2，寄存器/本地内存压力明显更高，实际是否更快必须看 profile。
+
+2. valid mask 从 `_consume_qk` 内部挪到 kernel 主体中计算一次。
+
+V4 每次 `_consume_qk` 都重新计算:
+
+```python
+causal = k_offs[None, :] <= q_offs[:, None]
+win = (q_offs[:, None] - k_offs[None, :]) < W
+valid = causal & win & q_mask[:, None] & k_mask[None, :]
+```
+
+这些值只依赖 query/key offsets 和 masks，与 head 无关。V5 在 CTA 开始处计算一次 `valid`，然后传给所有 cached/recomputed head 的 `_consume_qk`。这可以减少重复 integer/vector op，也略微缩短 `_consume_qk` 内部 live range。
+
+3. `a_acc` 继续保持 fp32。
+
+实验版 `triton_dc_onekernel_v5_hpg4.py` 曾测试 `a_acc_half=True`，但在 HPG=4 测试中没有带来额外速度收益，且相对 V4 的差异略增。因此正式 V5 保持 fp32 `a_acc`，只在 cached QK 精度、valid-hoist 和 `HPG=8` cache8 分支上做实验。
+
+### benchmark 脚本更新
+
+`bench_onekernel.py` 已更新:
+- 移除 V2 import、计时代码和表格列
+- 新增 `triton_dc_onekernel_v5.TritonDCOneKernel`
+- 输出新增 `V5`、`V5/fw`、`V5/V4`
+
+运行方式:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 /home/lishengping/miniconda3/bin/python bench_onekernel.py
+```
+
+### cache8 短测结果
+
+单点短测配置:
+
+```text
+B=16 T=4096 BM=16 W=112 G=4 HPG=8
+CUDA_VISIBLE_DEVICES=2 /home/lishengping/miniconda3/bin/python
+```
+
+结果:
+
+```text
+FA2w 2183 us
+V4   6106 us  2.80x FA2w
+V5   7786 us  3.57x FA2w  1.28x V4
+diff max_vs_v4=3.1250e-02 mean=3.3650e-04
+```
+
+结论: cache8 的理论 dot 数更低，但这个点上实际慢于 V4，说明 8 个 cached QK 的 live state 很可能造成了额外 register spill / occupancy 损失。当前 V5 保留该实现作为实验分支，后续完整 bench 需要重点观察 `HPG=8, W=112, KL=128` 的表现；如果整体仍慢，应该考虑把 `HPG=8` 回退到 fp16-cache4，或者只在特定 BM/W/autotune 配置下启用 cache8。
+
+### 待补 benchmark 结果
+
+把完整 bench 输出粘贴在这里:
+
+```text
+TODO: paste bench_onekernel.py V5 results here.
+```
+
+## Post-only one-kernel: Post0 / Post1
+
+文件:
+- `triton_dc_onekernel_Postv0.py`
+- `triton_dc_onekernel_Postv1.py`
+
+Post-only 版本去掉完整 pre path:
+- 不使用 `pre_w1 / pre_w2 / pre_dd`
+- score 退化为 plain scaled QK
+- 每个 head 只计算一次 QK
+- 保留 post path: `post_dd * probs`、`post_w1` 聚合到 `a_acc`、最终 `post_w2 * (a_acc @ V)`
+
+理论 dot 数:
+
+```text
+sATN:      H QK + H PV        = 2H
+Post-only: H QK + H PV + H AV = 3H
+```
+
+所以 post-only 相比 head-serial attention 的理论下限约为 `1.5x`。如果实际 `P0/sA` 或 `P1/sA` 已接近 `1.5x`，继续去掉 pre 不会带来数量级收益，主要瓶颈已经是 post 的 final AV pass。
+
+### Post1 优化点
+
+`Post1` 在 `Post0` 上做两个 AV-pass 相关实验:
+
+1. 延后 `a_acc += post_w1 * probs`。
+
+`Post0` 在 softmax 后先更新 `a_acc`，再做 direct PV。`Post1` 改成先用 `probs` 做 direct PV/store，再加载 `post_w1` 更新 `a_acc`。数学完全等价，目标是减少 direct PV 阶段与大矩阵 `a_acc` 更新交织造成的 live range / scheduling 压力。
+
+2. `HPG=8/16, D=128` 使用 wide2 final AV。
+
+final AV 中所有 head 共享同一个 `a_acc`，区别只在 `V_h`。`Post1` 对 `HPG=8/16` 尝试一次 `tl.dot(a_acc, V_pair)` 产出两个 head 的 AV，块形状从 `[BM, KL] x [KL, 128]` 变成 `[BM, KL] x [KL, 256]`，希望提高对同一个 `a_acc` 的复用。
+
+短测中 `HPG=32` 的 wide2 会变慢，`HPG=4` 基本没有收益且在 `W=240` 略慢，原因大概率是 `[BM, 256]` output、`pw2` 和 `o_prev` 同时 live 带来更高寄存器压力。因此当前只在 `HPG=8/16` 启用 wide2，`HPG=32/4` 走普通 final AV。
+
+### benchmark 脚本更新
+
+`bench_onekernel.py` 已新增:
+- `Post0`
+- `Post1`
+- `P1/fw`
+- `P1/P0`
+- `P1/sA`
+
+## Post2K: two-kernel post-only attempt
+
+文件: `triton_dc_onekernel_Post2K.py`
+
+目标是验证: 是否可以把 PostV1 中串行的 final AV pass 拆出去，用额外 A_BUF 换 head 并行度。
+
+最终保留的实现:
+- K1: grid = `(num_chunks, B * G)`，仍然 group-serial loop `HPG`，计算 QK/softmax/direct PV，同时累加 `a_acc`
+- K1 结束时把 `a_acc` 以 fp16 写入 `A_BUF[B, G, C, BM, KL]`
+- K2: grid = `(num_chunks, B * G, HPG/2)`，使用 wide2 final AV，一次读取同一个 `A_BUF` 并计算两个 head 的 `A_BUF @ V_h`
+- K2 把 `post_w2 * AV` 加回 K1 已写好的 direct output
+
+尝试过但不保留的方案:
+- K1 head-parallel + `tl.atomic_add(A_BUF, post_w1 * probs)`。这个版本要清零 A_BUF，而且 atomic/global 写开销很高，短测比 PostV1 慢约 `1.36x-1.81x`。
+- group-serial K1 + fp32 A_BUF。比 fp16 A_BUF 更慢，原因是 A_BUF 写读带宽翻倍。
+
+短测配置:
+
+```text
+B=16 T=4096 BM=16 N=32 D=128
+CUDA_VISIBLE_DEVICES=2 /home/lishengping/miniconda3/bin/python
+```
+
+fp16 A_BUF + wide2 K2 结果:
+
+```text
+W=112 FA2w=2170 us
+G=1 HPG=32 Post1=4337 us Post2K=5644 us P2K/P1=1.30 P2K/fw=2.60
+G=2 HPG=16 Post1=4118 us Post2K=5754 us P2K/P1=1.40 P2K/fw=2.65
+G=4 HPG=8  Post1=4077 us Post2K=5745 us P2K/P1=1.41 P2K/fw=2.65
+G=8 HPG=4  Post1=4374 us Post2K=5843 us P2K/P1=1.34 P2K/fw=2.69
+
+W=240 FA2w=3253 us
+G=1 HPG=32 Post1=10101 us Post2K=13390 us P2K/P1=1.33 P2K/fw=4.12
+G=2 HPG=16 Post1=9914  us Post2K=14071 us P2K/P1=1.42 P2K/fw=4.33
+G=4 HPG=8  Post1=10100 us Post2K=13972 us P2K/P1=1.38 P2K/fw=4.29
+G=8 HPG=4  Post1=10552 us Post2K=14530 us P2K/P1=1.38 P2K/fw=4.47
+```
+
+结论: 对当前 `BM=16, D=128, W=112/240`，Post2K 不值得。PostV1 把 `a_acc` 留在寄存器里复用，虽然 final AV 是 group 内串行，但避免了 `B*G*T*KL` 级别的 A_BUF 全局写读。Post2K 的 K2 head 并行收益抵不过 A_BUF 的全局内存流量和第二个 kernel launch。
+
+## Pre-only one-kernel: Pre0
+
+文件: `triton_dc_onekernel_Prev0.py`
+
+语义:
+- 保留 pre DC: `pre_w1 / pre_w2 / pre_dd`
+- 去掉 post DC: 不使用 `post_w1 / post_w2 / post_dd`
+- 输出为 pre-mixed logits softmax 后的 `PV`
+
+实现:
+- `HPG=4/8, KL<=128`: 缓存所有 QK，QK 累加到 fp32 `s_acc` 后转 fp16 保存，Sweep 2 直接消费 cached QK 做 pre-mixed softmax + PV
+- 其他配置: 通用 two-pass。第一遍计算所有 QK 累加 `s_acc`，第二遍重算 QK 做 pre-mixed softmax + PV
+- 接口兼容完整 6-tuple DC weights，也支持只传 `(pre_w1, pre_w2, pre_dd)`
+
+理论 dot 数:
+
+```text
+Pre-only generic: H QK + H QK(recompute) + H PV = 3H
+Pre-only cached HPG=4/8: H QK + H PV = 2H
+Full V4 HPG=8 cache4: 8 QK + 4 QK(recompute) + 8 PV + 8 AV = 28
+Pre0 HPG=8 cache8: 8 QK + 8 PV = 16
+```
+
+短测配置:
+
+```text
+B=16 T=4096 BM=16 N=32 D=128
+CUDA_VISIBLE_DEVICES=2 /home/lishengping/miniconda3/bin/python
+```
+
+结果:
+
+```text
+W=112 FA2w=2218 us
+G=1 HPG=32 V4=6311 us Pre0=4310 us Pre/fw=1.94 Pre/V4=0.68
+G=2 HPG=16 V4=6473 us Pre0=4267 us Pre/fw=1.92 Pre/V4=0.66
+G=4 HPG=8  V4=6022 us Pre0=3642 us Pre/fw=1.64 Pre/V4=0.60
+G=8 HPG=4  V4=5300 us Pre0=3483 us Pre/fw=1.57 Pre/V4=0.66
+
+W=240 FA2w=3257 us
+G=1 HPG=32 V4=13203 us Pre0=9752  us Pre/fw=2.99 Pre/V4=0.74
+G=2 HPG=16 V4=12941 us Pre0=9599  us Pre/fw=2.95 Pre/V4=0.74
+G=4 HPG=8  V4=13129 us Pre0=9718  us Pre/fw=2.98 Pre/V4=0.74
+G=8 HPG=4  V4=12720 us Pre0=10414 us Pre/fw=3.20 Pre/V4=0.82
+```
+
+结论: 去掉 post DC 后收益比去掉 pre DC 更稳定。`W=112, HPG=8` 的 `Pre/V4=0.60` 接近理论 dot ratio；`W=240` 仍然要走 generic two-pass 且 KL=256，收益稳定在 `0.74x` 左右。
+
+### 结果
+- 相比full dc，overhead减少15% ~ 30%
+B  BM    W   G  HPG |       V0       V1       V3       V4    Post0    Post1     FA2w |  V4/fw  P0/fw  P1/fw  P1/P0  P1/V4
+---------------------------------------------------------------------------------------------------------------------------
+  8  16  112   1   32 |    3769u    3701u    3289u    3281u    2328u    2246u    1100u |   2.98x   2.12x   2.04x   0.96x   0.68x
+  8  16  112   2   16 |    3772u    3590u    3271u    3249u    2279u    2127u    1100u |   2.95x   2.07x   1.93x   0.93x   0.65x
+  8  16  112   4    8 |    3680u    3423u    3184u    3021u    2228u    2106u    1100u |   2.75x   2.03x   1.91x   0.95x   0.70x
+  8  16  112   8    4 |    3409u    3087u    2988u    2655u    2227u    2208u    1100u |   2.41x   2.03x   2.01x   0.99x   0.83x
+  8  16  240   1   32 |   11365u   10045u    6613u    6630u    5070u    5056u    1621u |   4.09x   3.13x   3.12x   1.00x   0.76x
+  8  16  240   2   16 |   11308u    9453u    6475u    6490u    5010u    4999u    1621u |   4.00x   3.09x   3.08x   1.00x   0.77x
+  8  16  240   4    8 |   11344u    9554u    6561u    6554u    5053u    5064u    1621u |   4.04x   3.12x   3.12x   1.00x   0.77x
+  8  16  240   8    4 |   11952u   10875u    6359u    6360u    5268u    5271u    1621u |   3.92x   3.25x   3.25x   1.00x   0.83x
+ 16  16  112   1   32 |    7388u    7286u    6456u    6435u    4597u    4494u    2422u |   2.66x   1.90x   1.86x   0.98x   0.70x
+ 16  16  112   2   16 |    7529u    7315u    6520u    6491u    4619u    4281u    2422u |   2.68x   1.91x   1.77x   0.93x   0.66x
+ 16  16  112   4    8 |    7340u    6847u    6365u    6095u    4504u    4232u    2422u |   2.52x   1.86x   1.75x   0.94x   0.69x
+ 16  16  112   8    4 |    6781u    6205u    6016u    5382u    4511u    4496u    2422u |   2.22x   1.86x   1.86x   1.00x   0.84x
+ 16  16  240   1   32 |   22982u   20891u   13316u   13314u   10073u   10048u    3359u |   3.96x   3.00x   2.99x   1.00x   0.75x
+ 16  16  240   2   16 |   22676u   18746u   13022u   13047u    9968u    9858u    3359u |   3.88x   2.97x   2.93x   0.99x   0.76x
+ 16  16  240   4    8 |   23021u   18835u   13124u   13062u   10049u   10051u    3359u |   3.89x   2.99x   2.99x   1.00x   0.77x
+ 16  16  240   8    4 |   24208u   21855u   12676u   12710u   10502u   10508u    3359u |   3.78x   3.13x   3.13x   1.00x   0.83x
+ 32  16  112   1   32 |   14933u   14699u   12844u   12917u    9243u    8988u    4958u |   2.61x   1.86x   1.81x   0.97x   0.70x
+ 32  16  112   2   16 |   15339u   14473u   13005u   13126u    9230u    8560u    4958u |   2.65x   1.86x   1.73x   0.93x   0.65x
+ 32  16  112   4    8 |   14851u   13786u   12686u   12242u    9031u    8418u    4958u |   2.47x   1.82x   1.70x   0.93x   0.69x
+ 32  16  112   8    4 |   13804u   12566u   12159u   10741u    9010u    8998u    4958u |   2.17x   1.82x   1.81x   1.00x   0.84x
+ 32  16  240   1   32 |   46432u   42139u   26601u   26529u   20223u   20134u    6689u |   3.97x   3.02x   3.01x   1.00x   0.76x
+ 32  16  240   2   16 |   45236u   37572u   26121u   26031u   19852u   19567u    6689u |   3.89x   2.97x   2.93x   0.99x   0.75x
+ 32  16  240   4    8 |   45923u   37810u   26324u   26315u   20055u   19989u    6689u |   3.93x   3.00x   2.99x   1.00x   0.76x
+ 32  16  240   8    4 |   48392u   43526u   25505u   25494u   20983u   21010u    6689u |   3.81x   3.14x   3.14x   1.00x   0.82x
+ 64  16  112   1   32 |   30165u   29586u   25911u   25823u   18813u   18332u    9957u |   2.59x   1.89x   1.84x   0.97x   0.71x
+ 64  16  112   2   16 |   30595u   29220u   26319u   26201u   18897u   17312u    9957u |   2.63x   1.90x   1.74x   0.92x   0.66x
+ 64  16  112   4    8 |   29817u   27946u   25821u   24795u   18540u   17121u    9957u |   2.49x   1.86x   1.72x   0.92x   0.69x
+ 64  16  112   8    4 |   27667u   25573u   24483u   21779u   18368u   18314u    9957u |   2.19x   1.84x   1.84x   1.00x   0.84x
+ 64  16  240   1   32 |   93731u   85154u   53529u   53516u   40520u   40583u   13480u |   3.97x   3.01x   3.01x   1.00x   0.76x
+ 64  16  240   2   16 |   91071u   75619u   52488u   52491u   40056u   39522u   13480u |   3.89x   2.97x   2.93x   0.99x   0.75x
+ 64  16  240   4    8 |   92541u   76115u   53221u   53220u   40281u   40165u   13480u |   3.95x   2.99x   2.98x   1.00x   0.75x
+ 64  16  240   8    4 |   97572u   88698u   51697u   51696u   42044u   42064u   13480u |   3.83x   3.12x   3.12x   1.00x   0.81x
