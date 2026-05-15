@@ -1,2 +1,6 @@
 # ninja log v7
 0	63837	1778573583737875487	/home/lishengping/dc_triton_test/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o	859ce4419800aa39
+3	64886	1778772244845957480	/home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o	ec6a3f5cf86e9d98
+13	66207	1778773129324942135	/home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o	ec6a3f5cf86e9d98
+12	61180	1778773533721023596	/home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o	ec6a3f5cf86e9d98
+12	59578	1778774038344554174	/home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o	ec6a3f5cf86e9d98

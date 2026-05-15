@@ -12,7 +12,6 @@ from triton_dc_onekernel_v1 import TritonDCOneKernel as V1
 from triton_dc_onekernel_v2 import TritonDCOneKernel as V2
 from triton_dc_onekernel_v3 import TritonDCOneKernel as V3
 from triton_dc_onekernel_v4 import TritonDCOneKernel as V4
-from cuda_dc_onekernel_v4 import CudaDCOneKernelV4 as CV4
 from triton_dc_residual import TritonDCResidual4K as FK
 # from fa2w_head_serial import fa2w_head_serial
 from triton_attn_head_serial import AttnHeadSerial as sATTN
@@ -53,19 +52,19 @@ def rat(a, b):
     return f"{a / b:6.2f}x" if b > 0 and a < 1e9 else "   N/A"
 
 
-Bs = [16, 32]
+Bs = [8, 16, 32, 64]
 configs = [
     # (BM, W) — all need BM+W=power_of_2; V2 auto num_warps for large KL
     (16, 112),   # BM+W=128
-    (32, 96),    # BM+W=128
+    # (32, 96),    # BM+W=128
     (16, 240),   # BM+W=256
 ]
-Gs = [1, 2, 4, 8, 16, 32]
+Gs = [1, 2, 4, 8]
 
 hdr = (
     f"{'B':>3} {'BM':>3} {'W':>4} {'G':>3} {'HPG':>4} | "
-    f"{'V0':>8} {'V1':>8} {'V2':>8} {'V3':>8} {'V4':>8} {'CV4':>8} {'4k':>8} {'sATN':>8} {'FA2w':>8} | "
-    f"{'V3/fw':>6} {'V4/fw':>6} {'CV4/fw':>7} {'CV4/V4':>7} {'V4/V3':>6} {'4k/fw':>6} {'sA/fw':>6}"
+    f"{'V0':>8} {'V1':>8} {'V2':>8} {'V3':>8} {'V4':>8} {'4k':>8} {'sATN':>8} {'FA2w':>8} | "
+    f"{'V3/fw':>6} {'V4/fw':>6} {'V4/V3':>6} {'4k/fw':>6} {'sA/fw':>6}"
 )
 print(hdr)
 print("-" * len(hdr))
@@ -83,7 +82,7 @@ for B in Bs:
             HPG = N // G
 
             # V0/V1/V2/V3 (need HPG >= 2 and even)
-            us_v0 = us_v1 = us_v2 = us_v3 = us_v4 = us_cv4 = float("inf")
+            us_v0 = us_v1 = us_v2 = us_v3 = us_v4 = float("inf")
             if HPG >= 2 and HPG % 2 == 0:
                 try:
                     V0.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
@@ -96,8 +95,9 @@ for B in Bs:
                 except Exception:
                     pass
                 try:
-                    V2.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_v2 = bench(lambda: V2.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
+                    us_v2 = 0.0
+                    # V2.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
+                    # us_v2 = bench(lambda: V2.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
                 except Exception:
                     pass
 
@@ -113,15 +113,9 @@ for B in Bs:
                     us_v4 = bench(lambda: V4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
                 except Exception:
                     us_v4 = float("inf")
-                try:
-                    CV4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_cv4 = bench(lambda: CV4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
-                except Exception:
-                    us_cv4 = float("inf")
             else:
                 us_v3 = float("inf")
                 us_v4 = float("inf")
-                us_cv4 = float("inf")
 
             # 4K (4-kernel grouped via reshape, any HPG >= 1)
             try:
@@ -140,9 +134,9 @@ for B in Bs:
             print(
                 f"{B:3d} {BM:3d} {W:4d} {G:3d} {HPG:4d} | "
                 f"{fmt(us_v0)} {fmt(us_v1)} {fmt(us_v2)} {fmt(us_v3)} "
-                f"{fmt(us_v4)} {fmt(us_cv4)} {fmt(us_4k)} {fmt(us_sa)} {fmt(us_faw)} | "
-                f"{rat(us_v3, us_faw)} {rat(us_v4, us_faw)} {rat(us_cv4, us_faw)} "
-                f"{rat(us_cv4, us_v4)} {rat(us_v4, us_v3)} {rat(us_4k, us_faw)} {rat(us_sa, us_faw)}"
+                f"{fmt(us_v4)} {fmt(us_4k)} {fmt(us_sa)} {fmt(us_faw)} | "
+                f"{rat(us_v3, us_faw)} {rat(us_v4, us_faw)} {rat(us_v4, us_v3)} "
+                f"{rat(us_4k, us_faw)} {rat(us_sa, us_faw)}"
             )
 
         del q, k, v, ws, sl
@@ -153,8 +147,7 @@ print("V0   = 3-sweep, register s_acc/a_acc")
 print("V1   = fused sweep1+2, last pair cached")
 print("V2   = V1 + auto num_warps for large KL")
 print("V3   = V1 + exp2 softmax + autotune")
-print("V4   = G<=8/4<=HPG<=8/KL<=128 cache-four-QK specialization; otherwise V3 fallback")
-print("CV4  = CUDA implementation of the V4 cache-four-QK path; supports G=4/8 and KL<=128")
+print("V4   = optimized Triton cache-four-QK specialization; otherwise V3 fallback")
 print("4k   = TritonDCResidual4K (4-kernel, reshape B*G batches)")
 print("sATN = head-serial attn (same structure as V3, no DC mixing, with autotune)")
 print("FA2w = FlashAttention-2 causal sliding window (all heads parallel)")

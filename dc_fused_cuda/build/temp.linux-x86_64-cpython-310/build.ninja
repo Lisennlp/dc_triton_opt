@@ -26,7 +26,7 @@ rule cuda_compile
 
 
 
-build /home/lishengping/dc_triton_test/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o: cuda_compile /home/lishengping/dc_triton_test/dc_fused_cuda/kernel.cu
+build /home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/build/temp.linux-x86_64-cpython-310/kernel.o: cuda_compile /home/lishengping/dc_triton_test/dc_triton_opt/dc_fused_cuda/kernel.cu
 
 
 

@@ -809,6 +809,335 @@ __device__ void onk_compute_qk(
     }
 }
 
+__device__ __forceinline__ void onk_load_q_smem(
+    const half* __restrict__ Q,
+    half* __restrict__ q_smem,
+    int b, int q_start, int head,
+    int T, int seq_len, int chunk_size)
+{
+    const int elems = chunk_size * HEAD_DIM;
+    for (int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+        int m = idx / HEAD_DIM;
+        int d = idx - m * HEAD_DIM;
+        int q = q_start + m;
+        half val = __float2half(0.0f);
+        if (onk_q_valid(q, T, seq_len))
+            val = Q[onk_qkv_offset(b, q, head, d, T)];
+        q_smem[idx] = val;
+    }
+}
+
+__device__ __forceinline__ void onk_load_k64_smem(
+    const half* __restrict__ K,
+    half* __restrict__ k_smem,
+    int b, int k_base, int head,
+    int T, int seq_len, int k_tile_len)
+{
+    const int elems = BK * HEAD_DIM;
+    for (int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+        int j = idx / HEAD_DIM;
+        int d = idx - j * HEAD_DIM;
+        int k = k_base + j;
+        half val = __float2half(0.0f);
+        if (j < k_tile_len && k >= 0 && k < T && k < seq_len)
+            val = K[onk_qkv_offset(b, k, head, d, T)];
+        k_smem[idx] = val;
+    }
+}
+
+__device__ __forceinline__ void onk_load_v64_smem(
+    const half* __restrict__ V,
+    half* __restrict__ v_smem,
+    int b, int k_base, int head,
+    int T, int seq_len, int k_tile_len)
+{
+    const int elems = BK * HEAD_DIM;
+    for (int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+        int j = idx / HEAD_DIM;
+        int d = idx - j * HEAD_DIM;
+        int k = k_base + j;
+        half val = __float2half(0.0f);
+        if (j < k_tile_len && k >= 0 && k < T && k < seq_len)
+            val = V[onk_qkv_offset(b, k, head, d, T)];
+        v_smem[idx] = val;
+    }
+}
+
+__device__ void onk_compute_qk_wmma(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    float* __restrict__ qk,
+    char* __restrict__ temp,
+    int b, int q_start, int k_start, int head,
+    int T, int seq_len, int chunk_size, int kspan, int KL,
+    float scaling)
+{
+    half* q_smem = (half*)temp;
+    half* k_smem = q_smem + chunk_size * HEAD_DIM;
+    const int warp_id = threadIdx.x >> 5;
+    const int row_tile = warp_id >> 2;
+    const int col_tile = warp_id & 3;
+    const int row = row_tile * WM;
+    const int col = col_tile * WN;
+
+    onk_load_q_smem(Q, q_smem, b, q_start, head, T, seq_len, chunk_size);
+    __syncthreads();
+
+    const int num_ktiles = (KL + BK - 1) / BK;
+    for (int kt = 0; kt < num_ktiles; kt++) {
+        int k_off = kt * BK;
+        int k_tile_len = kspan > k_off ? min(BK, kspan - k_off) : 0;
+        onk_load_k64_smem(K, k_smem, b, k_start + k_off, head,
+                          T, seq_len, k_tile_len);
+        __syncthreads();
+
+        if (row < chunk_size) {
+            wmma::fragment<wmma::matrix_a, WM, WN, WK, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WM, WN, WK, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+
+            #pragma unroll
+            for (int kk = 0; kk < HEAD_DIM; kk += WK) {
+                wmma::load_matrix_sync(a_frag, q_smem + row * HEAD_DIM + kk, HEAD_DIM);
+                wmma::load_matrix_sync(b_frag, k_smem + col * HEAD_DIM + kk, HEAD_DIM);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+
+            #pragma unroll
+            for (int e = 0; e < c_frag.num_elements; e++)
+                c_frag.x[e] *= scaling;
+            wmma::store_matrix_sync(qk + row * KL + k_off + col,
+                                    c_frag, KL, wmma::mem_row_major);
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void onk_compute_qk_wmma_half(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ pre_w1,
+    half* __restrict__ qk,
+    float* __restrict__ s_acc,
+    char* __restrict__ temp,
+    int b, int q_start, int k_start, int head,
+    int T, int seq_len, int chunk_size, int kspan, int KL,
+    float scaling, bool add_pre)
+{
+    half* q_smem = (half*)temp;
+    half* k_smem = q_smem + chunk_size * HEAD_DIM;
+    float* tile_smem = (float*)(k_smem + BK * HEAD_DIM);
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_tile = warp_id >> 2;
+    const int col_tile = warp_id & 3;
+    const int row = row_tile * WM;
+    const int col = col_tile * WN;
+
+    onk_load_q_smem(Q, q_smem, b, q_start, head, T, seq_len, chunk_size);
+    __syncthreads();
+
+    const int num_ktiles = (KL + BK - 1) / BK;
+    for (int kt = 0; kt < num_ktiles; kt++) {
+        int k_off = kt * BK;
+        int k_tile_len = kspan > k_off ? min(BK, kspan - k_off) : 0;
+        onk_load_k64_smem(K, k_smem, b, k_start + k_off, head,
+                          T, seq_len, k_tile_len);
+        __syncthreads();
+
+        if (row < chunk_size) {
+            wmma::fragment<wmma::matrix_a, WM, WN, WK, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WM, WN, WK, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+
+            #pragma unroll
+            for (int kk = 0; kk < HEAD_DIM; kk += WK) {
+                wmma::load_matrix_sync(a_frag, q_smem + row * HEAD_DIM + kk, HEAD_DIM);
+                wmma::load_matrix_sync(b_frag, k_smem + col * HEAD_DIM + kk, HEAD_DIM);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+
+            #pragma unroll
+            for (int e = 0; e < c_frag.num_elements; e++)
+                c_frag.x[e] *= scaling;
+
+            float* tile = tile_smem + warp_id * WM * WN;
+            wmma::store_matrix_sync(tile, c_frag, WN, wmma::mem_row_major);
+            for (int r = lane; r < WM * WN; r += WARP_SIZE) {
+                int rm = r / WN;
+                int rd = r - rm * WN;
+                int m = row + rm;
+                int j = k_off + col + rd;
+                if (m < chunk_size && j < KL) {
+                    float val = tile[r];
+                    int idx = m * KL + j;
+                    qk[idx] = __float2half(val);
+                    if (add_pre) {
+                        int q = q_start + m;
+                        float w = onk_q_valid(q, T, seq_len)
+                            ? __half2float(pre_w1[onk_w_offset(b, q, head, T)])
+                            : 0.0f;
+                        s_acc[idx] += w * val;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void onk_store_xv_wmma(
+    const float* __restrict__ x,
+    const half* __restrict__ V,
+    const half* __restrict__ weight,
+    half* __restrict__ OUT,
+    char* __restrict__ temp,
+    int b, int q_start, int k_start, int head,
+    int T, int seq_len, int chunk_size, int kspan, int KL,
+    int mode)
+{
+    const int total = chunk_size * KL;
+    half* x_half = (half*)temp;
+    half* v_smem = x_half + total;
+    float* tile_smem = (float*)(v_smem + BK * HEAD_DIM);
+
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x)
+        x_half[idx] = __float2half(x[idx]);
+    __syncthreads();
+
+    const int warp_id = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+    const int row_tiles = chunk_size / WM;
+    const int col_tiles = HEAD_DIM / WN;
+    const int num_ktiles = (KL + BK - 1) / BK;
+    const int total_tiles = row_tiles * col_tiles;
+
+    for (int tile_id = warp_id; tile_id < total_tiles; tile_id += num_warps) {
+        int row_tile = tile_id / col_tiles;
+        int col_tile = tile_id - row_tile * col_tiles;
+        int row = row_tile * WM;
+        int col = col_tile * WN;
+
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        for (int kt = 0; kt < num_ktiles; kt++) {
+            int k_off = kt * BK;
+            int k_tile_len = kspan > k_off ? min(BK, kspan - k_off) : 0;
+            onk_load_v64_smem(V, v_smem, b, k_start + k_off, head,
+                              T, seq_len, k_tile_len);
+            __syncthreads();
+
+            #pragma unroll
+            for (int kk = 0; kk < BK; kk += WK) {
+                wmma::load_matrix_sync(a_frag, x_half + row * KL + k_off + kk, KL);
+                wmma::load_matrix_sync(b_frag, v_smem + kk * HEAD_DIM + col, HEAD_DIM);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            __syncthreads();
+        }
+
+        float* tile_out = tile_smem + warp_id * WM * WN;
+        wmma::store_matrix_sync(tile_out, c_frag, WN, wmma::mem_row_major);
+        for (int r = (threadIdx.x & 31); r < WM * WN; r += WARP_SIZE) {
+            int rm = r / WN;
+            int rd = r - rm * WN;
+            int m = row + rm;
+            int d = col + rd;
+            int q = q_start + m;
+            if (m < chunk_size && d < HEAD_DIM && onk_q_valid(q, T, seq_len)) {
+                long long o = onk_qkv_offset(b, q, head, d, T);
+                float coeff = __half2float(weight[onk_w_offset(b, q, head, T)]);
+                float val = tile_out[r];
+                if (mode == 0) {
+                    OUT[o] = __float2half((coeff + 1.0f) * val);
+                } else {
+                    float prev = __half2float(OUT[o]);
+                    OUT[o] = __float2half(prev + coeff * val);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+}
+
+__device__ void onk_store_xv_wmma_half(
+    const half* __restrict__ x_half,
+    const half* __restrict__ V,
+    const half* __restrict__ weight,
+    half* __restrict__ OUT,
+    char* __restrict__ temp,
+    int b, int q_start, int k_start, int head,
+    int T, int seq_len, int chunk_size, int kspan, int KL,
+    int mode)
+{
+    half* v_smem = (half*)temp;
+    float* tile_smem = (float*)(v_smem + BK * HEAD_DIM);
+
+    const int warp_id = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+    const int row_tiles = chunk_size / WM;
+    const int col_tiles = HEAD_DIM / WN;
+    const int num_ktiles = (KL + BK - 1) / BK;
+    const int total_tiles = row_tiles * col_tiles;
+
+    for (int tile_id = warp_id; tile_id < total_tiles; tile_id += num_warps) {
+        int row_tile = tile_id / col_tiles;
+        int col_tile = tile_id - row_tile * col_tiles;
+        int row = row_tile * WM;
+        int col = col_tile * WN;
+
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        for (int kt = 0; kt < num_ktiles; kt++) {
+            int k_off = kt * BK;
+            int k_tile_len = kspan > k_off ? min(BK, kspan - k_off) : 0;
+            onk_load_v64_smem(V, v_smem, b, k_start + k_off, head,
+                              T, seq_len, k_tile_len);
+            __syncthreads();
+
+            #pragma unroll
+            for (int kk = 0; kk < BK; kk += WK) {
+                wmma::load_matrix_sync(a_frag, x_half + row * KL + k_off + kk, KL);
+                wmma::load_matrix_sync(b_frag, v_smem + kk * HEAD_DIM + col, HEAD_DIM);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            __syncthreads();
+        }
+
+        float* tile_out = tile_smem + warp_id * WM * WN;
+        wmma::store_matrix_sync(tile_out, c_frag, WN, wmma::mem_row_major);
+        for (int r = (threadIdx.x & 31); r < WM * WN; r += WARP_SIZE) {
+            int rm = r / WN;
+            int rd = r - rm * WN;
+            int m = row + rm;
+            int d = col + rd;
+            int q = q_start + m;
+            if (m < chunk_size && d < HEAD_DIM && onk_q_valid(q, T, seq_len)) {
+                long long o = onk_qkv_offset(b, q, head, d, T);
+                float coeff = __half2float(weight[onk_w_offset(b, q, head, T)]);
+                float val = tile_out[r];
+                if (mode == 0) {
+                    OUT[o] = __float2half((coeff + 1.0f) * val);
+                } else {
+                    float prev = __half2float(OUT[o]);
+                    OUT[o] = __float2half(prev + coeff * val);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+}
+
 __device__ void onk_add_pre(
     const half* __restrict__ pre_w1,
     const float* __restrict__ qk,
@@ -833,10 +1162,10 @@ __device__ void onk_consume_head(
     const half* __restrict__ post_w1,
     const half* __restrict__ post_dd,
     half* __restrict__ OUT,
-    const float* __restrict__ qk,
+    half* __restrict__ qk,
     const float* __restrict__ s_acc,
     float* __restrict__ a_acc,
-    float* __restrict__ prob,
+    char* __restrict__ temp,
     int b, int q_start, int k_start, int head,
     int T, int seq_len, int chunk_size, int window, int kspan, int KL)
 {
@@ -858,7 +1187,8 @@ __device__ void onk_consume_head(
             for (int j = lane; j < KL; j += 32) {
                 int k = k_start + j;
                 bool valid = onk_attn_valid(q, j, k, T, seq_len, window, kspan);
-                float score = (pdd + 1.0f) * qk[m * KL + j] + pw2 * s_acc[m * KL + j];
+                float qkv = __half2float(qk[m * KL + j]);
+                float score = (pdd + 1.0f) * qkv + pw2 * s_acc[m * KL + j];
                 row_max = fmaxf(row_max, valid ? score : -FLT_MAX);
             }
             row_max = warp_reduce_max(row_max);
@@ -867,41 +1197,27 @@ __device__ void onk_consume_head(
             for (int j = lane; j < KL; j += 32) {
                 int k = k_start + j;
                 bool valid = onk_attn_valid(q, j, k, T, seq_len, window, kspan);
-                float score = (pdd + 1.0f) * qk[m * KL + j] + pw2 * s_acc[m * KL + j];
+                float qkv = __half2float(qk[m * KL + j]);
+                float score = (pdd + 1.0f) * qkv + pw2 * s_acc[m * KL + j];
                 float p = valid ? exp2f((score - row_max) * ONK_LOG2E) : 0.0f;
-                prob[m * KL + j] = p;
+                qk[m * KL + j] = __float2half(p);
                 row_sum += p;
             }
             row_sum = warp_reduce_sum(row_sum);
             float denom = row_sum > 0.0f ? row_sum : 1.0f;
 
             for (int j = lane; j < KL; j += 32) {
-                float p = prob[m * KL + j] / denom;
-                prob[m * KL + j] = p;
+                float p = __half2float(qk[m * KL + j]) / denom;
+                qk[m * KL + j] = __float2half(p);
                 a_acc[m * KL + j] += pw1p * p;
             }
         }
         __syncthreads();
     }
 
-    const int md_total = chunk_size * HEAD_DIM;
-    for (int idx = threadIdx.x; idx < md_total; idx += blockDim.x) {
-        int m = idx / HEAD_DIM;
-        int d = idx - m * HEAD_DIM;
-        int q = q_start + m;
-        if (onk_q_valid(q, T, seq_len)) {
-            float pv = 0.0f;
-            for (int j = 0; j < KL; j++) {
-                int k = k_start + j;
-                if (onk_k_valid(j, k, T, seq_len, kspan)) {
-                    pv += prob[m * KL + j] * __half2float(V[onk_qkv_offset(b, k, head, d, T)]);
-                }
-            }
-            float pddp = __half2float(post_dd[onk_w_offset(b, q, head, T)]);
-            OUT[onk_qkv_offset(b, q, head, d, T)] = __float2half((pddp + 1.0f) * pv);
-        }
-    }
-    __syncthreads();
+    onk_store_xv_wmma_half(qk, V, post_dd, OUT, temp,
+                           b, q_start, k_start, head,
+                           T, seq_len, chunk_size, kspan, KL, 0);
 }
 
 __global__ void dc_onekernel_v4_cache4_kernel(
@@ -936,9 +1252,9 @@ __global__ void dc_onekernel_v4_cache4_kernel(
     extern __shared__ float smem_f[];
     float* s_acc = smem_f;
     float* a_acc = s_acc + total;
-    float* qk_cache = a_acc + total;       // 4 * total
-    float* qk_tmp = qk_cache + 4 * total;
-    float* prob = qk_tmp + total;
+    half* qk_cache = (half*)(a_acc + total);       // 4 * total
+    half* qk_tmp = qk_cache;
+    char* temp = (char*)(qk_cache + 4 * total);
 
     for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
         s_acc[idx] = 0.0f;
@@ -951,16 +1267,14 @@ __global__ void dc_onekernel_v4_cache4_kernel(
     for (int pair_idx = 0; pair_idx < num_pairs - 2; pair_idx++) {
         int h0 = head_start + pair_idx * 2;
         int h1 = h0 + 1;
-        onk_compute_qk(Q, K, qk_tmp, b, q_start, k_start, h0,
-                       T, seq_len, chunk_size, window, kspan, KL, scaling);
-        __syncthreads();
-        onk_add_pre(pre_w1, qk_tmp, s_acc, b, q_start, h0, T, seq_len, chunk_size, KL);
+        onk_compute_qk_wmma_half(Q, K, pre_w1, qk_tmp, s_acc, temp,
+                                 b, q_start, k_start, h0,
+                                 T, seq_len, chunk_size, kspan, KL, scaling, true);
         __syncthreads();
 
-        onk_compute_qk(Q, K, qk_tmp, b, q_start, k_start, h1,
-                       T, seq_len, chunk_size, window, kspan, KL, scaling);
-        __syncthreads();
-        onk_add_pre(pre_w1, qk_tmp, s_acc, b, q_start, h1, T, seq_len, chunk_size, KL);
+        onk_compute_qk_wmma_half(Q, K, pre_w1, qk_tmp, s_acc, temp,
+                                 b, q_start, k_start, h1,
+                                 T, seq_len, chunk_size, kspan, KL, scaling, true);
         __syncthreads();
     }
 
@@ -972,74 +1286,58 @@ __global__ void dc_onekernel_v4_cache4_kernel(
 
     #pragma unroll
     for (int ci = 0; ci < 4; ci++) {
-        float* qk = qk_cache + ci * total;
-        onk_compute_qk(Q, K, qk, b, q_start, k_start, cached_heads[ci],
-                       T, seq_len, chunk_size, window, kspan, KL, scaling);
-        __syncthreads();
-        onk_add_pre(pre_w1, qk, s_acc, b, q_start, cached_heads[ci], T, seq_len, chunk_size, KL);
+        half* qk = qk_cache + ci * total;
+        onk_compute_qk_wmma_half(Q, K, pre_w1, qk, s_acc, temp,
+                                 b, q_start, k_start, cached_heads[ci],
+                                 T, seq_len, chunk_size, kspan, KL, scaling, true);
         __syncthreads();
     }
 
     // Same order as Triton V4: last pair, previous cached pair, then recomputed pairs.
     onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                     qk_cache + 2 * total, s_acc, a_acc, prob,
+                     qk_cache + 2 * total, s_acc, a_acc, temp,
                      b, q_start, k_start, cached_heads[2],
                      T, seq_len, chunk_size, window, kspan, KL);
     onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                     qk_cache + 3 * total, s_acc, a_acc, prob,
+                     qk_cache + 3 * total, s_acc, a_acc, temp,
                      b, q_start, k_start, cached_heads[3],
                      T, seq_len, chunk_size, window, kspan, KL);
     onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                     qk_cache, s_acc, a_acc, prob,
+                     qk_cache, s_acc, a_acc, temp,
                      b, q_start, k_start, cached_heads[0],
                      T, seq_len, chunk_size, window, kspan, KL);
     onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                     qk_cache + total, s_acc, a_acc, prob,
+                     qk_cache + total, s_acc, a_acc, temp,
                      b, q_start, k_start, cached_heads[1],
                      T, seq_len, chunk_size, window, kspan, KL);
 
     for (int pair_idx = 0; pair_idx < num_pairs - 2; pair_idx++) {
         int h0 = head_start + pair_idx * 2;
         int h1 = h0 + 1;
-        onk_compute_qk(Q, K, qk_tmp, b, q_start, k_start, h0,
-                       T, seq_len, chunk_size, window, kspan, KL, scaling);
+        onk_compute_qk_wmma_half(Q, K, pre_w1, qk_tmp, s_acc, temp,
+                                 b, q_start, k_start, h0,
+                                 T, seq_len, chunk_size, kspan, KL, scaling, false);
         __syncthreads();
         onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                         qk_tmp, s_acc, a_acc, prob,
+                         qk_tmp, s_acc, a_acc, temp,
                          b, q_start, k_start, h0,
                          T, seq_len, chunk_size, window, kspan, KL);
 
-        onk_compute_qk(Q, K, qk_tmp, b, q_start, k_start, h1,
-                       T, seq_len, chunk_size, window, kspan, KL, scaling);
+        onk_compute_qk_wmma_half(Q, K, pre_w1, qk_tmp, s_acc, temp,
+                                 b, q_start, k_start, h1,
+                                 T, seq_len, chunk_size, kspan, KL, scaling, false);
         __syncthreads();
         onk_consume_head(V, pre_w2, pre_dd, post_w1, post_dd, OUT,
-                         qk_tmp, s_acc, a_acc, prob,
+                         qk_tmp, s_acc, a_acc, temp,
                          b, q_start, k_start, h1,
                          T, seq_len, chunk_size, window, kspan, KL);
     }
 
-    const int md_total = chunk_size * HEAD_DIM;
     for (int h_local = 0; h_local < HPG; h_local++) {
         int head = head_start + h_local;
-        for (int idx = threadIdx.x; idx < md_total; idx += blockDim.x) {
-            int m = idx / HEAD_DIM;
-            int d = idx - m * HEAD_DIM;
-            int q = q_start + m;
-            if (onk_q_valid(q, T, seq_len)) {
-                float av = 0.0f;
-                for (int j = 0; j < KL; j++) {
-                    int k = k_start + j;
-                    if (onk_k_valid(j, k, T, seq_len, kspan)) {
-                        av += a_acc[m * KL + j] * __half2float(V[onk_qkv_offset(b, k, head, d, T)]);
-                    }
-                }
-                float pw2p = __half2float(post_w2[onk_w_offset(b, q, head, T)]);
-                long long o = onk_qkv_offset(b, q, head, d, T);
-                float prev = __half2float(OUT[o]);
-                OUT[o] = __float2half(prev + pw2p * av);
-            }
-        }
-        __syncthreads();
+        onk_store_xv_wmma(a_acc, V, post_w2, OUT, temp,
+                          b, q_start, k_start, head,
+                          T, seq_len, chunk_size, kspan, KL, 1);
     }
 }
 
@@ -1095,7 +1393,25 @@ torch::Tensor dc_onekernel_v4_fwd_cuda(
     int num_chunks = (T + chunk_size - 1) / chunk_size;
     dim3 grid(num_chunks, B * G);
     dim3 block(ONK_THREADS);
-    size_t smem = (size_t)8 * chunk_size * KL * sizeof(float);
+    size_t total = (size_t)chunk_size * KL;
+    size_t block_warps = ONK_THREADS / WARP_SIZE;
+    size_t base_smem = (size_t)2 * total * sizeof(float)
+                     + (size_t)4 * total * sizeof(half);
+    size_t qk_temp_smem =
+        (size_t)chunk_size * HEAD_DIM * sizeof(half)
+        + (size_t)BK * HEAD_DIM * sizeof(half)
+        + block_warps * WM * WN * sizeof(float);
+    size_t pv_temp_smem =
+        (size_t)BK * HEAD_DIM * sizeof(half)
+        + block_warps * WM * WN * sizeof(float);
+    size_t av_temp_smem =
+        total * sizeof(half)
+        + (size_t)BK * HEAD_DIM * sizeof(half)
+        + block_warps * WM * WN * sizeof(float);
+    size_t temp_smem = qk_temp_smem;
+    if (pv_temp_smem > temp_smem) temp_smem = pv_temp_smem;
+    if (av_temp_smem > temp_smem) temp_smem = av_temp_smem;
+    size_t smem = base_smem + temp_smem;
     cudaFuncSetAttribute(dc_onekernel_v4_cache4_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     dc_onekernel_v4_cache4_kernel<<<grid, block, smem>>>(
