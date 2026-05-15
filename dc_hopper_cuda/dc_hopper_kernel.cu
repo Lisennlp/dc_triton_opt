@@ -5,13 +5,21 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <mma.h>
 
 namespace {
+
+using namespace nvcuda;
 
 constexpr int kNHeads = 32;
 constexpr int kHeadDim = 128;
 constexpr int kG = 8;
 constexpr int kHPG = 4;
+constexpr int kWarpSize = 32;
+constexpr int kOptBM16 = 16;
+constexpr int kOptKL256 = 256;
+constexpr int kOptWarps = 8;
+constexpr int kOptThreads = kOptWarps * kWarpSize;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -189,6 +197,222 @@ __global__ void dc_hpg4_bm32_ref_kernel(
     }
 }
 
+__global__ void dc_hpg4_bm16_w240_wmma_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    const half* __restrict__ pre_w1,
+    const half* __restrict__ pre_w2,
+    const half* __restrict__ pre_dd,
+    const half* __restrict__ post_w1,
+    const half* __restrict__ post_w2,
+    const half* __restrict__ post_dd,
+    half* __restrict__ out,
+    int T,
+    float scaling) {
+    const int b = blockIdx.x;
+    const int m_block = blockIdx.y;
+    const int group = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / kWarpSize;
+    const int lane = tid & (kWarpSize - 1);
+    const int q_start = m_block * kOptBM16;
+    const int window = 240;
+    const int k_start = q_start - window + 1;
+
+    extern __shared__ unsigned char smem_raw[];
+    half* smem_h = reinterpret_cast<half*>(smem_raw);
+    half* q_smem = smem_h;                                                    // [4,16,128]
+    half* qk_smem = q_smem + kHPG * kOptBM16 * kHeadDim;                     // [4,16,256]
+    half* probs = qk_smem + kHPG * kOptBM16 * kOptKL256;                     // [4,16,256]
+    half* a_acc = probs + kHPG * kOptBM16 * kOptKL256;                       // [16,256]
+    half* k_warp = a_acc + kOptBM16 * kOptKL256;                             // [8,16,128]
+    half* a_tile_warp = k_warp + kOptWarps * 16 * kHeadDim;                  // [8,16,16]
+    half* v_tile_warp = a_tile_warp + kOptWarps * 16 * 16;                   // [8,16,16]
+    float* out_tile_warp = reinterpret_cast<float*>(v_tile_warp + kOptWarps * 16 * 16); // [8,16,16]
+
+    for (int idx = tid; idx < kHPG * kOptBM16 * kHeadDim; idx += blockDim.x) {
+        const int hloc = idx / (kOptBM16 * kHeadDim);
+        const int rem = idx - hloc * kOptBM16 * kHeadDim;
+        const int m = rem / kHeadDim;
+        const int d = rem - m * kHeadDim;
+        const int h = group * kHPG + hloc;
+        const int qpos = q_start + m;
+        q_smem[idx] = qpos < T ? q[qkv_idx(b, qpos, h, d, T)] : __float2half_rn(0.0f);
+    }
+    __syncthreads();
+
+    // QK: one warp computes one [16,16] tile, iterating over head and KL tiles.
+    for (int task = warp_id; task < kHPG * 16; task += kOptWarps) {
+        const int hloc = task / 16;
+        const int ktile = task - hloc * 16;
+        const int h = group * kHPG + hloc;
+        half* kbuf = k_warp + warp_id * 16 * kHeadDim;
+
+        for (int idx = lane; idx < 16 * kHeadDim; idx += kWarpSize) {
+            const int kk_row = idx / kHeadDim;
+            const int d = idx - kk_row * kHeadDim;
+            const int kpos = k_start + ktile * 16 + kk_row;
+            kbuf[idx] = (kpos >= 0 && kpos < T) ? k[qkv_idx(b, kpos, h, d, T)] : __float2half_rn(0.0f);
+        }
+        __syncwarp();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        #pragma unroll
+        for (int kk = 0; kk < kHeadDim; kk += 16) {
+            wmma::load_matrix_sync(a_frag, q_smem + hloc * kOptBM16 * kHeadDim + kk, kHeadDim);
+            wmma::load_matrix_sync(b_frag, kbuf + kk, kHeadDim);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        float* otmp = out_tile_warp + warp_id * 16 * 16;
+        wmma::store_matrix_sync(otmp, c_frag, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int idx = lane; idx < 16 * 16; idx += kWarpSize) {
+            const int m = idx / 16;
+            const int j = idx - m * 16;
+            const float val = otmp[idx] * scaling;
+            qk_smem[(hloc * kOptBM16 + m) * kOptKL256 + ktile * 16 + j] = __float2half_rn(val);
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+
+    // DC-pre + softmax. One thread owns one (head,row).
+    for (int row = tid; row < kHPG * kOptBM16; row += blockDim.x) {
+        const int hloc = row / kOptBM16;
+        const int m = row - hloc * kOptBM16;
+        const int h = group * kHPG + hloc;
+        const int qpos = q_start + m;
+        float max_score = -INFINITY;
+
+        if (qpos < T) {
+            const int wi = w_idx(b, qpos, h, T);
+            const float pw2 = __half2float(pre_w2[wi]);
+            const float pdd = 1.0f + __half2float(pre_dd[wi]);
+            for (int j = 0; j < kOptKL256; ++j) {
+                const int kpos = k_start + j;
+                float score = -INFINITY;
+                if (valid_qk(qpos, kpos, T, window)) {
+                    float s_acc = 0.0f;
+                    #pragma unroll
+                    for (int hh = 0; hh < kHPG; ++hh) {
+                        const int h2 = group * kHPG + hh;
+                        const int wi2 = w_idx(b, qpos, h2, T);
+                        const float w1 = __half2float(pre_w1[wi2]);
+                        const float qk_val = __half2float(qk_smem[(hh * kOptBM16 + m) * kOptKL256 + j]);
+                        s_acc += w1 * qk_val;
+                    }
+                    const float qk_h = __half2float(qk_smem[(hloc * kOptBM16 + m) * kOptKL256 + j]);
+                    score = pdd * qk_h + pw2 * s_acc;
+                }
+                probs[(hloc * kOptBM16 + m) * kOptKL256 + j] = __float2half_rn(score);
+                max_score = fmaxf(max_score, score);
+            }
+
+            float denom = 0.0f;
+            for (int j = 0; j < kOptKL256; ++j) {
+                const float score = __half2float(probs[(hloc * kOptBM16 + m) * kOptKL256 + j]);
+                const float p = isfinite(score) ? expf(score - max_score) : 0.0f;
+                probs[(hloc * kOptBM16 + m) * kOptKL256 + j] = __float2half_rn(p);
+                denom += p;
+            }
+            const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+            for (int j = 0; j < kOptKL256; ++j) {
+                const float p = __half2float(probs[(hloc * kOptBM16 + m) * kOptKL256 + j]) * inv_denom;
+                probs[(hloc * kOptBM16 + m) * kOptKL256 + j] = __float2half_rn(p);
+            }
+        } else {
+            for (int j = 0; j < kOptKL256; ++j) {
+                probs[(hloc * kOptBM16 + m) * kOptKL256 + j] = __float2half_rn(0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < kOptBM16 * kOptKL256; idx += blockDim.x) {
+        const int m = idx / kOptKL256;
+        const int j = idx - m * kOptKL256;
+        const int qpos = q_start + m;
+        float acc = 0.0f;
+        if (qpos < T) {
+            #pragma unroll
+            for (int hh = 0; hh < kHPG; ++hh) {
+                const int h2 = group * kHPG + hh;
+                const int wi2 = w_idx(b, qpos, h2, T);
+                const float w1 = __half2float(post_w1[wi2]);
+                const float p = __half2float(probs[(hh * kOptBM16 + m) * kOptKL256 + j]);
+                acc += w1 * p;
+            }
+        }
+        a_acc[idx] = __float2half_rn(acc);
+    }
+    __syncthreads();
+
+    // Final mixed @ V: one warp computes one [16,16] output tile.
+    for (int task = warp_id; task < kHPG * 8; task += kOptWarps) {
+        const int hloc = task / 8;
+        const int dtile = task - hloc * 8;
+        const int h = group * kHPG + hloc;
+        half* abuf = a_tile_warp + warp_id * 16 * 16;
+        half* vbuf = v_tile_warp + warp_id * 16 * 16;
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        for (int ktile = 0; ktile < 16; ++ktile) {
+            for (int idx = lane; idx < 16 * 16; idx += kWarpSize) {
+                const int m = idx / 16;
+                const int j = idx - m * 16;
+                const int qpos = q_start + m;
+                float mixed = 0.0f;
+                if (qpos < T) {
+                    const int wi = w_idx(b, qpos, h, T);
+                    const float pdd = 1.0f + __half2float(post_dd[wi]);
+                    const float pw2 = __half2float(post_w2[wi]);
+                    const int kidx = ktile * 16 + j;
+                    const float p = __half2float(probs[(hloc * kOptBM16 + m) * kOptKL256 + kidx]);
+                    const float aa = __half2float(a_acc[m * kOptKL256 + kidx]);
+                    mixed = pdd * p + pw2 * aa;
+                }
+                abuf[idx] = __float2half_rn(mixed);
+            }
+            for (int idx = lane; idx < 16 * 16; idx += kWarpSize) {
+                const int kk_row = idx / 16;
+                const int d = idx - kk_row * 16;
+                const int kpos = k_start + ktile * 16 + kk_row;
+                const int dpos = dtile * 16 + d;
+                vbuf[idx] = (kpos >= 0 && kpos < T) ? v[qkv_idx(b, kpos, h, dpos, T)] : __float2half_rn(0.0f);
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(a_frag, abuf, 16);
+            wmma::load_matrix_sync(b_frag, vbuf, 16);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncwarp();
+        }
+
+        float* otmp = out_tile_warp + warp_id * 16 * 16;
+        wmma::store_matrix_sync(otmp, c_frag, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int idx = lane; idx < 16 * 16; idx += kWarpSize) {
+            const int m = idx / 16;
+            const int d = idx - m * 16;
+            const int qpos = q_start + m;
+            const int dpos = dtile * 16 + d;
+            if (qpos < T) {
+                out[qkv_idx(b, qpos, h, dpos, T)] = __float2half_rn(otmp[idx]);
+            }
+        }
+        __syncwarp();
+    }
+}
+
 void check_fixed_inputs(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -325,4 +549,61 @@ torch::Tensor forward_hpg4_bm32_ref(
         scaling,
         window,
         32);
+}
+
+torch::Tensor forward_hpg4_wide_opt(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor pre_w1,
+    torch::Tensor pre_w2,
+    torch::Tensor pre_dd,
+    torch::Tensor post_w1,
+    torch::Tensor post_w2,
+    torch::Tensor post_dd,
+    double scaling,
+    int64_t window,
+    int64_t chunk_size) {
+    check_fixed_inputs(
+        q, k, v, pre_w1, pre_w2, pre_dd, post_w1, post_w2, post_dd, window, chunk_size);
+    TORCH_CHECK(
+        chunk_size == 16 && window == 240,
+        "current tensor-core opt path only supports BM=16,W=240");
+
+    const int B = static_cast<int>(q.size(0));
+    const int T = static_cast<int>(q.size(1));
+    auto out = torch::empty_like(q);
+
+    const int half_elems =
+        kHPG * kOptBM16 * kHeadDim +          // q_smem
+        kHPG * kOptBM16 * kOptKL256 +         // qk_smem
+        kHPG * kOptBM16 * kOptKL256 +         // probs
+        kOptBM16 * kOptKL256 +                // a_acc
+        kOptWarps * 16 * kHeadDim +           // per-warp K tile
+        kOptWarps * 16 * 16 +                 // per-warp A tile
+        kOptWarps * 16 * 16;                  // per-warp V tile
+    const int smem_bytes = half_elems * static_cast<int>(sizeof(half)) +
+                           kOptWarps * 16 * 16 * static_cast<int>(sizeof(float));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        dc_hpg4_bm16_w240_wmma_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
+
+    dim3 grid(B, (T + kOptBM16 - 1) / kOptBM16, kG);
+    dc_hpg4_bm16_w240_wmma_kernel<<<
+        grid, kOptThreads, smem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_w1.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_w2.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(pre_dd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_w1.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_w2.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(post_dd.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        T,
+        static_cast<float>(scaling));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }

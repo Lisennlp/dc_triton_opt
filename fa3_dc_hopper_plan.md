@@ -259,6 +259,34 @@ Interpretation:
 - Use `mean <= 1e-3` and `max <= 1.2e-1` as the current scaffold pass gate.
 - New correctness runs should focus on `BM=32,W=224` and `BM=16,W=240`.
 
+Wide-window scaffold result after retargeting to `KL=256`:
+
+```text
+B=1,T=256,BM=32,W=224: max=5.86e-2, mean=5.57e-4 PASS
+B=1,T=512,BM=32,W=224: max=4.81e-2, mean=5.61e-4 PASS
+B=1,T=256,BM=16,W=240: max=3.13e-2, mean=5.58e-4 PASS
+B=1,T=512,BM=16,W=240: max=5.86e-2, mean=5.55e-4 PASS
+B=2,T=256,BM=32,W=224: max=6.25e-2, mean=5.63e-4 PASS
+B=2,T=512,BM=32,W=224: max=4.69e-2, mean=5.53e-4 PASS
+B=2,T=256,BM=16,W=240: max=6.05e-2, mean=5.54e-4 PASS
+B=2,T=512,BM=16,W=240: max=4.69e-2, mean=5.61e-4 PASS
+```
+
+Conclusion:
+- The `KL=256` API, head/group indexing, and wide-window masks are validated.
+- Next implementation work should not change this reference path; add a separate
+  optimized entry and compare against `forward_hpg4_wide_ref`.
+
+First tensor-core experiment:
+- Added `forward_hpg4_wide_opt`.
+- Current scope is only `BM=16,W=240,KL=256`.
+- It uses CUDA WMMA for QK and final `mixed @ V`, while leaving DC-pre,
+  softmax, and `a_acc` as scalar/shared-memory code.
+- This is a stepping stone to judge the one-CTA HPG=4 dataflow; it is not the
+  final FA3-style WGMMA/TMA pipeline.
+- Validate with `test_dc_hopper_cuda.py --opt`, then benchmark with
+  `bench_dc_hopper_cuda.py`.
+
 ## Performance gate
 
 The first useful H100 target is:

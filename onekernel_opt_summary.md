@@ -813,5 +813,17 @@ FA3 相比 FA2 在 CUDA 上真正需要借鉴的点:
 
 CUDA correctness scaffold 初测:
 - 新增 `dc_hopper_cuda.forward_hpg4_wide_ref`，固定 `G=8, HPG=4, KL=256`，覆盖 `BM=32,W=224` 和 `BM=16,W=240`。
-- H100 上对比 V4HCM/V4HCM256，已看到 `mean ~= 5.5e-4`，`max <= 9.4e-2` 的结果。
+- H100 上对比 V4HCM256，宽窗口全 PASS:
+
+```text
+BM=32,W=224: mean ~= 5.5e-4, max <= 6.25e-2
+BM=16,W=240: mean ~= 5.6e-4, max <= 6.05e-2
+```
+
 - 这说明 API、window/group/head 索引基本正确；它不是性能版本，下一步需要把 scalar QK/PV 替换为 FA3-style WGMMA/TMA pipeline。
+
+CUDA opt 实验入口:
+- 新增 `dc_hopper_cuda.forward_hpg4_wide_opt`。
+- 当前只覆盖 `BM=16,W=240,KL=256`。
+- QK 和 final `mixed @ V` 改为 CUDA WMMA tensor core，DC-pre/softmax/a_acc 仍是标量 shared-memory path。
+- 这个版本用于判断 one-CTA HPG=4 数据流是否有性能潜力；最终目标仍是 FA3-style WGMMA/TMA/warp-specialized pipeline。

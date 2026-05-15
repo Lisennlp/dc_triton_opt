@@ -28,3 +28,24 @@ cd dc_triton_opt/dc_hopper_cuda
 
 Do not add this extension to `bench_onekernel_h100.py` until the WGMMA/TMA
 version passes the correctness gate in `../fa3_dc_hopper_plan.md`.
+
+Run correctness:
+
+```bash
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py
+```
+
+Run the first tensor-core experiment:
+
+```bash
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python test_dc_hopper_cuda.py --opt
+```
+
+If `--opt` passes, run the isolated microbenchmark:
+
+```bash
+cd ..
+CUDA_VISIBLE_DEVICES=1 /home/lishengping/miniconda3/bin/python bench_dc_hopper_cuda.py
+```
