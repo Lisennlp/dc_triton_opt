@@ -1,0 +1,3 @@
+# ninja log v7
+0	15237	1778874493358012090	/home/lishengping/dc_triton_test/dc_triton_opt/dc_hopper_cuda/build/temp.linux-x86_64-cpython-310/dc_hopper_api.o	aa2ffba0d911cca2
+1	59384	1778874493358012090	/home/lishengping/dc_triton_test/dc_triton_opt/dc_hopper_cuda/build/temp.linux-x86_64-cpython-310/dc_hopper_kernel.o	4257eebad7afb097

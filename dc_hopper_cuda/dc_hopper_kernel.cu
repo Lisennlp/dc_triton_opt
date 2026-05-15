@@ -202,6 +202,7 @@ __global__ void dc_hpg4_wide_cluster_kernel(
             out[qkv_idx(b, qpos, h, d, T)] = __float2half_rn(acc);
         }
     }
+    cluster.sync();
 }
 
 __global__ void dc_hpg4_bm32_ref_kernel(

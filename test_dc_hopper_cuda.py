@@ -56,6 +56,7 @@ def check(B: int, T: int, BM: int, W: int, use_opt: bool = False, use_cluster: b
     ref = TritonDCOneKernelMixedProbs256.forward(
         q, k, v, ws, scaling, W, None, G=8, chunk_size=BM
     )
+    torch.cuda.synchronize()
 
     if use_cluster:
         try:
@@ -122,7 +123,15 @@ def check(B: int, T: int, BM: int, W: int, use_opt: bool = False, use_cluster: b
         max_limit = 1.2e-1
         mean_limit = 1.0e-3
         label = "REF"
-    torch.cuda.synchronize()
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        print(
+            f"{label} B={B:2d} T={T:4d} BM={BM:2d} W={W:3d}: "
+            f"SYNC ERROR {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
 
     diff = (got.float() - ref.float()).abs()
     max_diff = diff.max().item()
@@ -161,6 +170,8 @@ def main():
     all_passed = True
     for B in (1, 2):
         for T, BM, W in ((256, 32, 224), (512, 32, 224), (256, 16, 240), (512, 16, 240)):
+            mode = "CLUSTER" if args.cluster else ("OPT" if args.opt else "REF")
+            print(f"Running {mode} B={B} T={T} BM={BM} W={W}", flush=True)
             all_passed = check(B, T, BM, W, use_opt=args.opt, use_cluster=args.cluster) and all_passed
     if not all_passed:
         raise RuntimeError("dc_hopper_cuda correctness gate failed")
