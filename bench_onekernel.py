@@ -1,42 +1,79 @@
-"""Benchmark: single-kernel DC variants.
+"""A800 / FlashAttention-2 benchmark for one-kernel DC variants.
 
-Run: CUDA_VISIBLE_DEVICES=2 python bench_onekernel.py
+Run:
+  CUDA_VISIBLE_DEVICES=2 python bench_onekernel.py
+
+Environment knobs:
+  B_LIST=8,16,32,64
+  CONFIGS=16:112,32:96,16:240,32:224
+  G_LIST=8
+  WARMUP=10
+  REPEAT=30
+  RUN_COMPONENTS=0   # set 1 to also benchmark Pre0/Post0/Post1
 """
+
+from __future__ import annotations
 
 import math
 import os
-import subprocess
-import sys
 import time
+
 import torch
 from flash_attn import flash_attn_func
-from triton_dc_onekernel_v0 import TritonDCOneKernel as V0
-from triton_dc_onekernel_v1 import TritonDCOneKernel as V1
+
 from triton_dc_onekernel_v3 import TritonDCOneKernel as V3
 from triton_dc_onekernel_v4 import TritonDCOneKernel as V4
-from triton_dc_onekernel_v4_h100 import TritonDCOneKernelCombinedProbs as V4H
+from triton_dc_onekernel_v5 import TritonDCOneKernel as V5
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernel as V4H
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernelCombined as V4HC
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernelCombinedProbs as V4HCP
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernelMixedProbs as V4HCM
+from triton_dc_onekernel_v4_h100 import TritonDCOneKernelMixedProbs256 as V4HCM256
 from triton_dc_onekernel_Prev0 import TritonDCOneKernel as PreV0
 from triton_dc_onekernel_Postv0 import TritonDCOneKernel as PostV0
 from triton_dc_onekernel_Postv1 import TritonDCOneKernel as PostV1
 
+
 device = "cuda"
 dtype = torch.float16
 N, D = 32, 128
-T = 4096
+T = int(os.environ.get("T", "4096"))
 sc = 1.0 / math.sqrt(D)
-warmup, repeat = 10, 30
-_fa3_interface = None
-_fa3_cu_seqlens = {}
-_fa3_error = None
-_flash_error = None
-_variant_errors = {}
-_fa3_mode = os.environ.get("RUN_FA3", "auto").strip().lower()
-_flash_mode = os.environ.get("FLASH_BASELINE", "auto").strip().lower()
-_flex_attention_compiled = None
-_flex_block_masks = {}
+warmup = int(os.environ.get("WARMUP", "10"))
+repeat = int(os.environ.get("REPEAT", "30"))
+run_components = os.environ.get("RUN_COMPONENTS", "0") == "1"
+
+_variant_errors: dict[str, str] = {}
+_fa2_error: str | None = None
 
 
-def make(B, T):
+def parse_int_list(name: str, default: str) -> list[int]:
+    raw = os.environ.get(name, default)
+    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if not vals:
+        raise ValueError(f"{name} produced an empty list")
+    return vals
+
+
+def parse_configs(default: str) -> list[tuple[int, int]]:
+    raw = os.environ.get("CONFIGS", default)
+    configs: list[tuple[int, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        bm_s, w_s = item.replace("x", ":").split(":")
+        configs.append((int(bm_s), int(w_s)))
+    if not configs:
+        raise ValueError("CONFIGS produced an empty list")
+    return configs
+
+
+def next_power_of_2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def make(B: int):
     q = torch.randn(B, T, N, D, device=device, dtype=dtype)
     k = torch.randn(B, T, N, D, device=device, dtype=dtype)
     v = torch.randn(B, T, N, D, device=device, dtype=dtype)
@@ -56,361 +93,205 @@ def bench(fn):
     return (time.perf_counter() - t0) / repeat * 1e6
 
 
-def fmt(v):
-    return f"{v:7.0f}u" if v < 1e9 else "    FAIL"
+def fmt_us(v: float) -> str:
+    return f"{v:8.0f}u" if v < 1e9 else "    FAIL"
 
 
-def rat(a, b):
-    return f"{a / b:6.2f}x" if b > 0 and a < 1e9 and b < 1e9 else "   N/A"
+def fmt_ratio(a: float, b: float) -> str:
+    return f"{a / b:6.2f}x" if a < 1e9 and b < 1e9 and b > 0 else "   N/A"
 
 
-def device_info():
-    idx = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(idx)
-    return idx, major, minor, torch.cuda.get_device_name(idx)
-
-
-def select_flash_baseline():
-    if _flash_mode in ("flex", "torch", "compile", "compiled"):
-        return "flex"
-    if _flash_mode in ("fa2", "flash_attn", "flash-attn"):
-        return "fa2"
-    idx, major, _minor, name = device_info()
-    if major >= 12 or "RTX" in name:
-        return "flex"
-    return "fa2"
-
-
-def get_compiled_flex_attention():
-    global _flex_attention_compiled
-    if _flex_attention_compiled is None:
-        from torch.nn.attention.flex_attention import flex_attention
-
-        _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
-    return _flex_attention_compiled
-
-
-def get_flex_block_mask(T, window, device):
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    device_idx = device.index
-    if device_idx is None:
-        device_idx = torch.cuda.current_device()
-    key = (device_idx, T, int(window))
-    block_mask = _flex_block_masks.get(key)
-    if block_mask is None:
-        W = int(window)
-
-        def sliding_window_mask(_b, _h, q_idx, kv_idx):
-            return (kv_idx <= q_idx) & ((q_idx - kv_idx) < W)
-
-        block_mask = create_block_mask(
-            sliding_window_mask,
-            None,
-            None,
-            T,
-            T,
-            device=device,
-            BLOCK_SIZE=128,
-        )
-        _flex_block_masks[key] = block_mask
-    return block_mask
-
-
-def make_flash_window_fn(q, k, v, softmax_scale, window):
-    backend = select_flash_baseline()
-    if backend == "flex":
-        qh = q.transpose(1, 2)
-        kh = k.transpose(1, 2)
-        vh = v.transpose(1, 2)
-        block_mask = get_flex_block_mask(q.shape[1], window, q.device)
-        flex_attention = get_compiled_flex_attention()
-        return "FlexW", lambda: flex_attention(
-            qh, kh, vh, block_mask=block_mask, scale=softmax_scale
-        )
-
-    return "FA2w", lambda: flash_attn_func(
-        q, k, v, softmax_scale=softmax_scale, causal=True, window_size=(window - 1, 0)
-    )
-
-
-def fa3_supported(device):
-    global _fa3_error
-    if _fa3_mode in ("0", "false", "no", "off", "skip"):
-        _fa3_error = "disabled by RUN_FA3=0"
-        return False
-
-    device_idx = device.index
-    if device_idx is None:
-        device_idx = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device_idx)
-    name = torch.cuda.get_device_name(device_idx)
-    if major < 9:
-        _fa3_error = (
-            f"requires sm90+ Hopper/Blackwell; current device is sm{major}{minor} "
-            f"({name})"
-        )
-        return False
-    if _fa3_mode not in ("1", "true", "yes", "on", "force"):
-        hopper_names = ("H100", "H200", "H800")
-        if not any(token in name for token in hopper_names):
-            _fa3_error = (
-                f"skipped in RUN_FA3=auto for {name}; use RUN_FA3=1 to force, "
-                "or RUN_FA3=0 to skip explicitly"
-            )
-            return False
-    return True
-
-
-def get_fa3_interface():
-    global _fa3_interface, _fa3_error
-    if _fa3_interface is not None:
-        return _fa3_interface
-    if _fa3_error is not None:
-        raise RuntimeError(_fa3_error)
-    try:
-        from kernels import get_kernel
-
-        _fa3_interface = get_kernel("varunneal/flash-attention-3").flash_attn_interface
-        return _fa3_interface
-    except Exception as exc:
-        _fa3_error = f"{type(exc).__name__}: {exc}"
-        raise RuntimeError(_fa3_error) from exc
-
-
-def fa3_cu_seqlens(B, T, device):
-    device_idx = device.index
-    if device_idx is None:
-        device_idx = torch.cuda.current_device()
-    key = (device_idx, B, T)
-    cu = _fa3_cu_seqlens.get(key)
-    if cu is None:
-        cu = torch.arange(0, (B + 1) * T, T, device=device, dtype=torch.int32)
-        _fa3_cu_seqlens[key] = cu
-    return cu
-
-
-def fa3_window_attention(q, k, v, softmax_scale, window):
-    B, T, H, D = q.shape
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
-        raise RuntimeError("FA3 hub kernel only supports BF16 in this environment")
-
-    cu = fa3_cu_seqlens(B, T, q.device)
-    out = get_fa3_interface().flash_attn_varlen_func(
-        q.reshape(B * T, H, D),
-        k.reshape(B * T, H, D),
-        v.reshape(B * T, H, D),
-        cu_seqlens_q=cu,
-        cu_seqlens_k=cu,
-        max_seqlen_q=T,
-        max_seqlen_k=T,
-        softmax_scale=softmax_scale,
+def fa2_window_attention(q, k, v, window: int):
+    return flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=sc,
         causal=True,
         window_size=(window - 1, 0),
     )
-    if isinstance(out, tuple):
-        out = out[0]
-    return out.view(B, T, H, D)
 
 
-def bench_fa3_subprocess(B, T, H, D, softmax_scale, window):
-    global _fa3_error
-    if _fa3_error is not None or not fa3_supported(torch.device(device)):
-        return float("inf")
+def supports_v4(G: int, HPG: int, KL: int) -> bool:
+    return G <= 8 and 4 <= HPG <= 8 and KL <= 128
 
-    code = f"""
-import time
-import torch
-from kernels import get_kernel
 
-B={B}
-T={T}
-H={H}
-D={D}
-softmax_scale={float(softmax_scale)}
-window={int(window)}
-warmup={warmup}
-repeat={repeat}
+def supports_v5(G: int, HPG: int, KL: int) -> bool:
+    return G <= 8 and 4 <= HPG <= 8 and KL <= 128
 
-q = torch.randn(B, T, H, D, device='cuda', dtype=torch.bfloat16)
-k = torch.randn(B, T, H, D, device='cuda', dtype=torch.bfloat16)
-v = torch.randn(B, T, H, D, device='cuda', dtype=torch.bfloat16)
-cu = torch.arange(0, (B + 1) * T, T, device='cuda', dtype=torch.int32)
-iface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
-def run():
-    out = iface.flash_attn_varlen_func(
-        q.reshape(B * T, H, D),
-        k.reshape(B * T, H, D),
-        v.reshape(B * T, H, D),
-        cu_seqlens_q=cu,
-        cu_seqlens_k=cu,
-        max_seqlen_q=T,
-        max_seqlen_k=T,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=(window - 1, 0),
-    )
-    if isinstance(out, tuple):
-        out = out[0]
-    return out
+def supports_v4h(G: int, HPG: int, KL: int) -> bool:
+    return G <= 8 and 4 <= HPG <= 8 and KL <= 256
 
-for _ in range(warmup):
-    run()
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-for _ in range(repeat):
-    run()
-torch.cuda.synchronize()
-print((time.perf_counter() - t0) / repeat * 1e6)
-"""
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            text=True,
-            capture_output=True,
-            timeout=240,
-            check=False,
-        )
-    except Exception as exc:
-        _fa3_error = f"{type(exc).__name__}: {exc}"
-        return float("inf")
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip().splitlines()
-        _fa3_error = err[-1] if err else f"FA3 subprocess exited with {proc.returncode}"
+
+def supports_hpg4_128(BM: int, W: int, G: int, HPG: int, KL: int) -> bool:
+    return G <= 8 and HPG == 4 and KL == 128 and BM + W == 128
+
+
+def supports_hpg4_256(BM: int, W: int, G: int, HPG: int, KL: int) -> bool:
+    return G <= 8 and HPG == 4 and KL == 256 and BM + W == 256
+
+
+def run_variant(name: str, fn, enabled: bool) -> float:
+    if not enabled:
         return float("inf")
     try:
-        return float(proc.stdout.strip().splitlines()[-1])
+        fn()
+        return bench(fn)
     except Exception as exc:
-        _fa3_error = f"failed to parse FA3 subprocess output: {type(exc).__name__}: {exc}"
+        _variant_errors.setdefault(name, f"{type(exc).__name__}: {exc}")
         return float("inf")
 
 
-Bs = [16, 32]
-configs = [
-    # (BM, W) — small-window H100 trial, both use KL=128.
-    (16, 112),   # preferred setting: smaller register tile.
-    (32, 96),    # larger M, more pressure; included to check H100 behavior.
-    (16, 240),    # larger M, more pressure; included to check H100 behavior.
-]
-Gs = [8]  # fixed target for the HPG=4 / W+BM=128 H100 small-window branch
-flash_col = "FlexW" if select_flash_baseline() == "flex" else "FA2w"
+def full_dc_variants(q, k, v, ws, sl, BM: int, W: int, G: int, HPG: int, KL: int):
+    return [
+        (
+            "V3",
+            True,
+            lambda: V3.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+        (
+            "V4",
+            supports_v4(G, HPG, KL),
+            lambda: V4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+        (
+            "V5",
+            supports_v5(G, HPG, KL),
+            lambda: V5.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+        (
+            "V4H",
+            supports_v4h(G, HPG, KL),
+            lambda: V4H.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
+        (
+            "V4HC",
+            supports_hpg4_128(BM, W, G, HPG, KL),
+            lambda: V4HC.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
+        (
+            "V4HCP",
+            supports_hpg4_128(BM, W, G, HPG, KL),
+            lambda: V4HCP.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
+        (
+            "V4HCM",
+            supports_hpg4_128(BM, W, G, HPG, KL),
+            lambda: V4HCM.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
+        (
+            "V4HCM256",
+            supports_hpg4_256(BM, W, G, HPG, KL),
+            lambda: V4HCM256.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM),
+        ),
+    ]
+
+
+def component_variants(q, k, v, ws, sl, BM: int, W: int, G: int):
+    pre_ws = ws[:3]
+    post_ws = ws[3:]
+    return [
+        (
+            "Pre0",
+            True,
+            lambda: PreV0.forward(q, k, v, pre_ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+        (
+            "Post0",
+            True,
+            lambda: PostV0.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+        (
+            "Post1",
+            True,
+            lambda: PostV1.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM),
+        ),
+    ]
+
+
+Bs = parse_int_list("B_LIST", "8,16,32,64")
+configs = parse_configs("16:112,32:96,16:240,32:224")
+Gs = parse_int_list("G_LIST", "8")
+
+full_variant_names = ["V3", "V4", "V5", "V4H", "V4HC", "V4HCP", "V4HCM", "V4HCM256"]
+variant_names = list(full_variant_names)
+ratio_names = ["V3", "V4", "V5", "V4H", "V4HCM", "V4HCM256"]
+if run_components:
+    variant_names += ["Pre0", "Post0", "Post1"]
+    ratio_names += ["Pre0", "Post1"]
 
 hdr = (
-    f"{'B':>3} {'BM':>3} {'W':>4} {'G':>3} {'HPG':>4} | "
-    f"{'V0':>8} {'V1':>8} {'V3':>8} {'V4':>8} {'V4H':>8} {'Pre0':>8} {'Post0':>8} {'Post1':>8} {flash_col:>8} {'FA3w':>8} | "
-    f"{'V4/fa3':>7} {'V4H/fa3':>8} {'Pre/fa3':>8} {'P1/fa3':>7} {'V4H/V4':>7} {'Pre/V4':>7} {'P1/V4':>6}"
+    f"{'B':>3} {'BM':>3} {'W':>4} {'G':>3} {'HPG':>4} {'KL':>4} | "
+    f"{'FA2w':>8} "
+    + " ".join(f"{name:>9}" for name in variant_names)
+    + " | "
+    + " ".join(f"{name + '/fw':>10}" for name in ratio_names)
+    + f" {'Best':>9} {'Best/fw':>8}"
 )
 print(hdr)
 print("-" * len(hdr))
 
 for B in Bs:
     for BM, W in configs:
-        q, k, v, ws, sl = make(B, T)
-
+        q, k, v, ws, sl = make(B)
         try:
-            _flash_name, flash_fn = make_flash_window_fn(q, k, v, sc, W)
-            us_flashw = bench(flash_fn)
-            if us_flashw < 10.0:
-                _flash_error = f"measured {us_flashw:.2f} us for B={B}, W={W}; ignored as implausible"
-                us_flashw = float("inf")
+            us_fa2w = bench(lambda: fa2_window_attention(q, k, v, W))
+            if us_fa2w < 10.0:
+                _fa2_error = f"measured {us_fa2w:.2f} us for B={B}, BM={BM}, W={W}"
+                us_fa2w = float("inf")
         except Exception as exc:
-            _flash_error = f"{type(exc).__name__}: {exc}"
-            us_flashw = float("inf")
-        us_fa3w = bench_fa3_subprocess(B, T, N, D, sc, W)
+            _fa2_error = f"{type(exc).__name__}: {exc}"
+            us_fa2w = float("inf")
 
         for G in Gs:
             if N % G != 0:
                 continue
             HPG = N // G
+            if HPG < 2 or HPG % 2 != 0:
+                continue
 
-            pre_ws = ws[:3]
-            post_ws = ws[3:]
+            KL = next_power_of_2(BM + W - 1)
+            timings: dict[str, float] = {}
 
-            # V0/V1/V3/V4 (need HPG >= 2 and even)
-            us_v0 = us_v1 = us_v3 = us_v4 = us_v4h = us_pre0 = us_p0 = us_p1 = float("inf")
-            if HPG >= 2 and HPG % 2 == 0:
-                try:
-                    V0.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_v0 = bench(lambda: V0.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
-                except Exception:
-                    pass
-                try:
-                    V1.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_v1 = bench(lambda: V1.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
-                except Exception:
-                    pass
+            for name, enabled, fn in full_dc_variants(q, k, v, ws, sl, BM, W, G, HPG, KL):
+                timings[name] = run_variant(name, fn, enabled)
 
-            # V3 (needs HPG >= 2 and even)
-            if HPG >= 2 and HPG % 2 == 0:
-                try:
-                    V3.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_v3 = bench(lambda: V3.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
-                except Exception:
-                    us_v3 = float("inf")
-                try:
-                    V4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM)
-                    us_v4 = bench(lambda: V4.forward(q, k, v, ws, sc, W, sl, G=G, chunk_size=BM))
-                except Exception:
-                    us_v4 = float("inf")
-                try:
-                    V4H.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM)
-                    us_v4h = bench(lambda: V4H.forward(q, k, v, ws, sc, W, None, G=G, chunk_size=BM))
-                except Exception:
-                    us_v4h = float("inf")
+            if run_components:
+                for name, enabled, fn in component_variants(q, k, v, ws, sl, BM, W, G):
+                    timings[name] = run_variant(name, fn, enabled)
+
+            valid_full = [(name, timings[name]) for name in full_variant_names if timings.get(name, float("inf")) < 1e9]
+            if valid_full:
+                best_name, best_us = min(valid_full, key=lambda item: item[1])
             else:
-                us_v3 = float("inf")
-                us_v4 = float("inf")
-                us_v4h = float("inf")
-
-            # PreV0: pre-only DC, no post weights.
-            try:
-                PreV0.forward(q, k, v, pre_ws, sc, W, sl, G=G, chunk_size=BM)
-                us_pre0 = bench(lambda: PreV0.forward(q, k, v, pre_ws, sc, W, sl, G=G, chunk_size=BM))
-            except Exception:
-                us_pre0 = float("inf")
-
-            # PostV0: post-only DC, no pre weights and one QK per head
-            try:
-                PostV0.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM)
-                us_p0 = bench(lambda: PostV0.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM))
-            except Exception:
-                us_p0 = float("inf")
-
-            # PostV1: PostV0 + reordered a_acc update + HPG=16 wide2 final AV
-            try:
-                PostV1.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM)
-                us_p1 = bench(lambda: PostV1.forward(q, k, v, post_ws, sc, W, sl, G=G, chunk_size=BM))
-            except Exception:
-                us_p1 = float("inf")
+                best_name, best_us = "N/A", float("inf")
 
             print(
-                f"{B:3d} {BM:3d} {W:4d} {G:3d} {HPG:4d} | "
-                f"{fmt(us_v0)} {fmt(us_v1)} {fmt(us_v3)} {fmt(us_v4)} {fmt(us_v4h)} "
-                f"{fmt(us_pre0)} {fmt(us_p0)} {fmt(us_p1)} {fmt(us_flashw)} {fmt(us_fa3w)} | "
-                f"{rat(us_v4, us_fa3w)} {rat(us_v4h, us_fa3w)} "
-                f"{rat(us_pre0, us_fa3w)} {rat(us_p1, us_fa3w)} "
-                f"{rat(us_v4h, us_v4)} {rat(us_pre0, us_v4)} {rat(us_p1, us_v4)}"
+                f"{B:3d} {BM:3d} {W:4d} {G:3d} {HPG:4d} {KL:4d} | "
+                f"{fmt_us(us_fa2w)} "
+                + " ".join(fmt_us(timings.get(name, float("inf"))) for name in variant_names)
+                + " | "
+                + " ".join(fmt_ratio(timings.get(name, float("inf")), us_fa2w) for name in ratio_names)
+                + f" {best_name:>9} {fmt_ratio(best_us, us_fa2w)}"
             )
 
         del q, k, v, ws, sl
         torch.cuda.empty_cache()
 
 print()
-print("V0   = 3-sweep, register s_acc/a_acc")
-print("V1   = fused sweep1+2, last pair cached")
-print("V3   = V1 + exp2 softmax + autotune")
-print("V4   = optimized Triton cache-four-QK specialization; otherwise V3 fallback")
-print("V4H  = H100-oriented V4 experiment; HPG=4/W+BM=128 has a fixed small-window branch")
-print("Pre0 = pre-only DC: keep pre logits mixing, remove post mixing/output path")
-print("Post0= post-only DC: no pre weights, one QK per head, post mixing only")
-print("Post1= Post0 + delayed a_acc update + HPG=8/16 wide2 final AV")
-print("FlexW= torch.compile flex_attention causal sliding window, FP16 inputs; used automatically on RTX/Blackwell")
-print("FA2w = FlashAttention-2 causal sliding window, FP16 inputs; used automatically on non-RTX/non-Blackwell")
-print("FA3w = FlashAttention-3 varlen causal sliding window, BF16 inputs; BF16 casts are outside timing")
-if _flash_error is not None:
-    print(f"{flash_col} unavailable/error: {_flash_error}")
-if _fa3_error is not None:
-    print(f"FA3w unavailable/error: {_fa3_error}")
+print("FA2w     = FlashAttention-2 causal sliding window, FP16 inputs")
+print("V3       = exp2 softmax + autotune baseline")
+print("V4       = cache-four-QK specialization, only shown when it does not fall back to V3")
+print("V5       = A800-oriented V5 cache4/cache8 path, only shown when it does not fall back")
+print("V4H      = H100-oriented V4 experiment; measured on A800 for portability comparison")
+print("V4HC     = BM+W=128 combined-output path, one OUT store")
+print("V4HCP    = V4HC + cached fp16 probabilities")
+print("V4HCM    = V4HCP + mixed final attention weights, one final V dot")
+print("V4HCM256 = V4HCM idea for BM+W=256 / KL=256")
+if run_components:
+    print("Pre0/Post0/Post1 are component experiments, not full DC replacements.")
+if _fa2_error is not None:
+    print(f"FA2w unavailable/error: {_fa2_error}")
 for name, err in _variant_errors.items():
     print(f"{name} unavailable/error: {err}")

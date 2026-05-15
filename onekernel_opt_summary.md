@@ -627,4 +627,181 @@ B  BM    W   G  HPG |       V0       V1       V3       V4    Post0    Post1     
  64  16  240   1   32 |   93731u   85154u   53529u   53516u   40520u   40583u   13480u |   3.97x   3.01x   3.01x   1.00x   0.76x
  64  16  240   2   16 |   91071u   75619u   52488u   52491u   40056u   39522u   13480u |   3.89x   2.97x   2.93x   0.99x   0.75x
  64  16  240   4    8 |   92541u   76115u   53221u   53220u   40281u   40165u   13480u |   3.95x   2.99x   2.98x   1.00x   0.75x
- 64  16  240   8    4 |   97572u   88698u   51697u   51696u   42044u   42064u   13480u |   3.83x   3.12x   3.12x   1.00x   0.81x
+  64  16  240   8    4 |   97572u   88698u   51697u   51696u   42044u   42064u   13480u |   3.83x   3.12x   3.12x   1.00x   0.81x
+
+## H100-oriented V4H -> V4HCM256 optimization log
+
+这一轮的目标是解释并缩小 H100 上 DC one-kernel 相对 FA3 的 overhead。A800 上相对 FA2-w 的 overhead 已经较低，但 H100 上 FA3 基线吃到了 Hopper 的 WGMMA/TMA/warp-specialized pipeline，导致同一个 Triton DC kernel 的相对 overhead 被明显放大。
+
+### V4H: H100-oriented V4 baseline
+
+文件: `triton_dc_onekernel_v4_h100.py`
+
+初始思路:
+- 保持 V4 的 one-kernel full DC 数据流。
+- cached QK 在参与 fp32 pre aggregation 后转成 fp16，降低 live register 压力。
+- causal/window mask 只计算一次并复用。
+- `G<=8, HPG=4/8, KL<=256` 走 H100 实验路径，不支持时 fallback 到 V4。
+- `HPG=8, KL<=128` 保留 cache8 分支，避免第二遍 QK recompute。
+- final shared `a_acc @ V` 对 `D=128` 尝试 wide2，一次 dot 计算两个 head 的 AV。
+
+观察:
+- H100 上 V4H 相比 V4 有稳定小幅收益，`BM=16,W=112` 大约 `0.94x-0.96x V4`，`BM=32,W=96` 大约 `0.90x V4`。
+- 但相对 FA3 仍是 `3.2x-3.8x`，说明单纯 fp16 cache/mask hoist 不能弥补 FA3 的 Hopper pipeline 优势。
+
+### V4HC: combined output / one OUT store
+
+问题: V4/V4H 的 post path 会先写 direct PV output，再在 final AV pass 读 OUT、加 `post_w2 * AV`、再写 OUT。这个读改写增加 HBM 流量，也拉长 output live path。
+
+优化:
+- 先完整构建 group-shared `a_acc`。
+- 再对每个 head 计算 direct PV 和 shared AV，并一次性写最终 OUT。
+- 数学仍是:
+
+```text
+out_h = (post_dd_h + 1) * (probs_h @ V_h) + post_w2_h * (a_acc @ V_h)
+```
+
+效果:
+- `BM+W=128, HPG=4` 上 H100 大约从 V4 的 `3.6x-4.0x FA3` 降到 `~3.1x-3.3x FA3`。
+- 但仍然有两次 V dot: `probs @ V` 和 `a_acc @ V`。
+
+### V4HCP: cache probs to remove second softmax
+
+V4HC 为了先 build `a_acc`，final output 阶段需要再次用 QK/s_acc 还原 `probs_h`，等价于第二次 softmax。V4HCP 把每个 head 的 `probs` 以 fp16 缓存在寄存器里:
+
+```text
+compute probs_h
+a_acc += post_w1_h * probs_h
+cache probs_h as fp16
+...
+final: use cached probs_h for direct PV
+```
+
+效果:
+- `BM=32,W=96` 收益很明显，H100 `V4HCP/V4 ~= 0.59x-0.60x`。
+- `BM=16,W=112` 收益较小，H100 `V4HCP/V4 ~= 0.75x-0.76x`，原因是 `BM=16` 的 M 维太小，H100 tensor core 利用率更差，同时 cached probs 增加 register pressure。
+
+### V4HCM: mixed final attention weights / one final V dot
+
+关键代数化简:
+
+```text
+out_h = (post_dd_h + 1) * (probs_h @ V_h) + post_w2_h * (a_acc @ V_h)
+      = (((post_dd_h + 1) * probs_h + post_w2_h * a_acc) @ V_h)
+```
+
+实现:
+- 保留 V4HCP 的 fp16 cached `probs_h`。
+- final 阶段先构造 fp16 `mixed_h = (post_dd_h+1)*probs_h + post_w2_h*a_acc`。
+- 每个 head 只做一次 `mixed_h @ V_h`。
+- 同时保持 one OUT store。
+
+效果:
+- 这是当前 `BM+W=128` 最有效的 Triton 优化。
+- H100:
+
+```text
+BM=16,W=112: V4HCM/FA3 ~= 2.30x-2.55x, V4HCM/V4 ~= 0.63x-0.64x
+BM=32,W=96 : V4HCM/FA3 ~= 1.93x-2.08x, V4HCM/V4 ~= 0.53x-0.55x
+```
+
+- A800:
+
+```text
+BM=16,W=112: V4HCM/FA2w ~= 1.42x-1.63x
+BM=32,W=96 : V4HCM/FA2w ~= 1.08x-1.15x
+```
+
+结论:
+- 对 `BM+W=128`，`BM=32,W=96` 比 `BM=16,W=112` 更适合 H100，主要因为 M 维更大、tensor core 利用更好。
+- `W=112` 的 overhead 大于 A800，不是 DC 算术比例变差，而是 FA3 基线在 H100 上提升太多，当前 Triton kernel 没有 WGMMA/TMA pipeline。
+
+### V4HCM256: extend mixed-output to BM+W=256
+
+目标:
+- 让 `W` 尽可能大，同时测试 `BM+W=256/KL=256`。
+- 重点配置:
+  - `BM=16,W=240`
+  - `BM=32,W=224`
+
+实现:
+- 将 HPG=4 专用 kernel 的 `kl_offs/s_acc/a_acc` 从固定 128 扩展为 `KL`。
+- 新增 `TritonDCOneKernelMixedProbs256`，仅在 `D=128,G<=8,HPG=4,KL=256,BM+W=256` 走专用 mixed-output 路径。
+- 其他形状 fallback，benchmark 中避免 fallback 数字混入专用列。
+
+结果:
+- H100:
+
+```text
+BM=16,W=240: V4HCM256/FA3 ~= 4.17x-4.35x, V4HCM256/V4 ~= 0.64x-0.65x
+BM=32,W=224: V4HCM256/FA3 ~= 3.54x-3.76x, V4HCM256/V4 ~= 0.60x-0.61x
+```
+
+- A800:
+
+```text
+BM=16,W=240: V4HCM256/FA2w ~= 2.44x-2.58x
+BM=32,W=224: V4HCM256/FA2w ~= 2.04x-2.14x
+```
+
+结论:
+- `BM=32,W=224` 明显优于 `BM=16,W=240`，尽管寄存器压力更高，但更大的 M 维提高了 matmul 利用率。
+- `KL=256` 相比 `KL=128` 的 H100 overhead 仍然偏大，核心原因是 live state 翻倍: `s_acc/a_acc/qk/probs/mixed` 都变成 `[BM,256]`，而 FA3 的 baseline 仍有 Hopper pipeline 加速。
+
+### V4HMR / V4HMR256 diagnostic: recompute probs instead of caching
+
+假设:
+- H100 上可能是 cached `probs0..3` 造成 register pressure / occupancy 下降。
+- 尝试不缓存 probs，在 final mixed output 前重算 softmax，用额外 softmax 换更少 live state。
+
+实现:
+- `TritonDCOneKernelMixedRecompute`
+- `TritonDCOneKernelMixedRecompute256`
+- 只作为诊断版本，最终已从 benchmark 表中移除。
+
+H100 结果:
+
+```text
+BM=16,W=112: V4HCM 958us,  V4HMR 1213us
+BM=32,W=96 : V4HCM 797us,  V4HMR 1253us
+BM=16,W=240: V4HCM256 2218us, V4HMR256 2774us
+BM=32,W=224: V4HCM256 1858us, V4HMR256 4150us
+```
+
+结论:
+- 重算 softmax 不值得；cached probs 是正确方向。
+- H100 剩余差距不是简单的 register cache/recompute tradeoff 能解决。
+- 特别是 `BM=32,W=224`，重算版本严重退化，说明 `KL=256` 下 softmax/reduction 标量开销和 live range 都不可接受。
+
+### 当前最优与下一步
+
+当前 one-kernel Triton 最优:
+
+```text
+BM+W=128: V4HCM
+  H100: BM=32,W=96 约 1.93x-2.08x FA3
+  A800: BM=32,W=96 约 1.08x-1.15x FA2w
+
+BM+W=256: V4HCM256
+  H100: BM=32,W=224 约 3.54x-3.76x FA3
+  A800: BM=32,W=224 约 2.04x-2.14x FA2w
+```
+
+从数据看，Triton 路线已经接近其可用上限:
+- `BM=32` 比 `BM=16` 更适合 H100。
+- `W=96` 的 H100 overhead 已接近目标。
+- `W=112/240` 相对 FA3 偏高，主要因为当前 Triton 实现没有使用 Hopper 专属 WGMMA/TMA/warp-specialized pipeline。
+
+下一步需要转向 CUDA/Hopper:
+1. **FA3 CUDA 内核里插 DC**: 复用 FA3 的 TMA/WGMMA pipeline、tile scheduling、online softmax 和 epilogue，只在 score 构造与 output epilogue 加入 DC cross-head state。
+2. **独立 Hopper CUDA/WGMMA kernel**: 从 DC 的 group-serial HPG=4 数据流出发，手写 `BM=32, W=96/224, D=128` 固定形状 kernel，优先实现 forward-only、full length、G=8、HPG=4。
+
+FA3 相比 FA2 在 CUDA 上真正需要借鉴的点:
+- WGMMA 替代 sm80/WMMA 风格的小 warp tile。
+- TMA 异步搬运 Q/K/V tile 到 shared memory。
+- producer/consumer warp-specialized pipeline，隐藏 K/V load、QK、softmax、PV 之间的等待。
+- FA3 的 tile scheduler / local window block range 逻辑。
+- 保留 V4HCM 的 mixed-probability identity，最终只做一次 `mixed @ V` 并一次写 OUT。
+
+因此 CUDA 版本不能只是把 Triton 的标量/reduction 逻辑翻译成 `.cu`。真正目标是: `TMA K/V staging + WGMMA QK/PV + FA3-style pipeline + DC 的两处 group barrier`。
